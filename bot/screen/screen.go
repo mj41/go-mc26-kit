@@ -69,7 +69,7 @@ func hashedStackOf(s *Slot) hashedStack {
 	if s == nil || s.Count <= 0 {
 		return hashedStack{}
 	}
-	return hashedStack{Has: true, Val: types.HashedStackActualItem{Item: s.ItemID, Count: s.Count}}
+	return hashedStack{Has: true, Val: types.HashedStackActualItem{Item: s.Item, Count: s.Count}}
 }
 
 func (m *Manager) onOpenScreen(p pk.Packet) error {

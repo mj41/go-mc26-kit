@@ -166,10 +166,10 @@ func onScreenSlotChange(id, index int) error {
 			case *screen.Inventory:
 				slot := container.Slots[index]
 				itemName := "nil"
-				if slot.ItemID >= 0 && int(slot.ItemID) < len(registryid.Item) {
-					itemName = registryid.Item[slot.ItemID]
+				if slot.Item >= 0 && int(slot.Item) < len(registryid.Item) {
+					itemName = registryid.Item[slot.Item]
 				}
-				log.Printf("Slot: Screen[%d].Slot[%d]: [%v] * %d | Components: +%d/-%d", id, index, itemName, slot.Count, len(slot.Components.Added), len(slot.Components.Removed))
+				log.Printf("Slot: Screen[%d].Slot[%d]: [%v] * %d | Components: +%d/-%d", id, index, itemName, slot.Count, len(slot.Components.Positive), len(slot.Components.Negative))
 			}
 		}
 	}
