@@ -1,0 +1,27 @@
+# The kit builds against every supported library version: add a tag here when
+# one is released.
+name: ci
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # every supported library version: the kit's sources build against each
+        lib: ["v0.261.0", "v0.262.0"]
+    env:
+      GOFLAGS: -mod=mod # go.sum may lack a library line until its tag is public
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go get github.com/mj41/go-mc26@${{ matrix.lib }}
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
