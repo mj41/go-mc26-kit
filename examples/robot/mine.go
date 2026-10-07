@@ -643,6 +643,18 @@ func (r *robot) digOres() map[string]int {
 	skip := map[world.BlockPos]bool{}
 	p := r.player.Position()
 	feet := world.BlockPos{X: int(math.Floor(p.X)), Y: int(math.Floor(p.Y + 1e-6)), Z: int(math.Floor(p.Z))}
+	// back onto its step after (a dig or the pickup may move it: up onto
+	// the ore's place, along the wall): the next step goes on from there
+	step := r.standCell()
+	defer func() {
+		if r.standCell() != step {
+			if err := r.goToLevel(step); err != nil {
+				plan("descend: back to its step %v: %v", step, err)
+				return
+			}
+			r.centre()
+		}
+	}()
 	var floorHoles []world.BlockPos
 	targets := oreBlocks()
 	// coal enough (torches, a night's smelting): its ore passed by, the
