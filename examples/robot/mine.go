@@ -100,6 +100,14 @@ func cmdDescend(r *robot, args []string) (string, error) {
 		if r.player.Status().Health < 10 {
 			r.rest(16) // hurt: healed before it goes on
 		}
+		// the work between (tools made, home to a furnace, a fight) may have
+		// moved it: back onto its step, in its middle, before the next one
+		if r.standCell() != c {
+			if err := r.goToLevel(c); err != nil {
+				return "", fmt.Errorf("step %d: back to its step %v: %w", step, c, err)
+			}
+			r.centre()
+		}
 		d := dirs[dir]
 		fx, fz := x+d[0], z+d[1]
 		if why := r.stepDanger(fx, y, fz); why != "" {
