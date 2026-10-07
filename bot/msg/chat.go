@@ -44,13 +44,13 @@ func New(c *bot.Client, p *basic.Player, pl *playerlist.PlayerList, events Event
 			F: m.handleSystemChat,
 		})
 	}
-	if events.PlayerChatMessage != nil {
+	if events.PlayerChatMessage != nil || events.PlayerChat != nil {
 		c.Events.AddListener(bot.PacketHandler{
 			Priority: 64, ID: packetid.ClientboundPlayPlayerChat,
 			F: m.handlePlayerChat,
 		})
 	}
-	if events.DisguisedChat != nil {
+	if events.DisguisedChat != nil || events.PlayerChat != nil {
 		c.Events.AddListener(bot.PacketHandler{
 			Priority: 64, ID: packetid.ClientboundPlayDisguisedChat,
 			F: m.handleDisguisedChat,
@@ -124,7 +124,22 @@ func (m *Manager) handlePlayerChat(packet pk.Packet) error {
 		content = chat.Text(string(body.Content))
 	}
 	msg := chatType.Decorate(content, decoration)
-	return m.events.PlayerChatMessage(msg, validated)
+	if m.events.PlayerChatMessage != nil {
+		if err := m.events.PlayerChatMessage(msg, validated); err != nil {
+			return err
+		}
+	}
+	if m.events.PlayerChat == nil {
+		return nil
+	}
+	return m.events.PlayerChat(PlayerChat{
+		Sender:    uuid.UUID(sender),
+		Name:      senderInfo.Name,
+		Content:   string(body.Content),
+		Type:      m.chatTypeName(&chatType),
+		Message:   msg,
+		Validated: validated,
+	})
 }
 
 // chatDecoration resolves the chat decoration for a bound chat type: the inline
@@ -151,8 +166,30 @@ func (m *Manager) handleDisguisedChat(packet pk.Packet) error {
 		return err
 	}
 	msg := dc.ChatType.Decorate(dc.Message, decoration)
+	if m.events.DisguisedChat != nil {
+		if err := m.events.DisguisedChat(msg); err != nil {
+			return err
+		}
+	}
+	if m.events.PlayerChat == nil {
+		return nil
+	}
+	return m.events.PlayerChat(PlayerChat{
+		Disguised: true,
+		Name:      dc.ChatType.SenderName.ClearString(),
+		Content:   dc.Message.ClearString(),
+		Type:      m.chatTypeName(&dc.ChatType),
+		Message:   msg,
+	})
+}
 
-	return m.events.DisguisedChat(msg)
+// chatTypeName is the registry name of a bound chat type, "" for an inline one.
+func (m *Manager) chatTypeName(t *chat.Type) string {
+	if t.Inline != nil {
+		return ""
+	}
+	name, _ := m.c.Registries.ChatType.KeyOf(t.ID)
+	return name
 }
 
 // SendMessage send chat message to server.

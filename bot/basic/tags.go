@@ -1,32 +1,12 @@
 package basic
 
-import (
-	"bytes"
+import pk "github.com/mj41/go-mc26/net/packet"
 
-	pk "github.com/mj41/go-mc26/net/packet"
-)
-
+// handleUpdateTags applies tags the server sends during play (after a
+// /reload), as the configuration phase does.
 func (p *Player) handleUpdateTags(packet pk.Packet) error {
-	r := bytes.NewReader(packet.Data)
-
-	var length pk.VarInt
-	_, err := length.ReadFrom(r)
-	if err != nil {
+	if err := p.c.ReadUpdateTags(packet.Data); err != nil {
 		return Error{err}
-	}
-
-	var registryID pk.Identifier
-	for i := 0; i < int(length); i++ {
-		_, err = registryID.ReadFrom(r)
-		if err != nil {
-			return Error{err}
-		}
-
-		registry := p.c.Registries.Registry(string(registryID))
-		_, err = registry.ReadTagsFrom(r)
-		if err != nil {
-			return Error{err}
-		}
 	}
 	return nil
 }

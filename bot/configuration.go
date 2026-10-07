@@ -3,7 +3,6 @@ package bot
 import (
 	"bytes"
 	"fmt"
-	"io"
 
 	"github.com/mj41/go-mc26/chat"
 	"github.com/mj41/go-mc26/data/packetid"
@@ -202,37 +201,8 @@ func (c *Client) joinConfiguration(conn packetReadWriter) error {
 			c.ConfigHandler.EnableFeature(features.Features)
 
 		case packetid.ClientboundConfigurationUpdateTags:
-			const ErrStage = "update tags"
-			r := bytes.NewReader(p.Data)
-
-			var length pk.VarInt
-			_, err := length.ReadFrom(r)
-			if err != nil {
-				return ConfigErr{ErrStage, err}
-			}
-
-			var registryID pk.Identifier
-			for i := 0; i < int(length); i++ {
-				_, err = registryID.ReadFrom(r)
-				if err != nil {
-					return ConfigErr{ErrStage, err}
-				}
-
-				registry := c.Registries.Registry(string(registryID))
-				if registry == nil {
-					// TODO: Sice our registry system is incompelted, ignore all tags bind to non-exist registry
-					_, err = idleTagsDecoder{}.ReadFrom(r)
-					if err != nil {
-						return ConfigErr{ErrStage, err}
-					}
-					continue
-					// return ConfigErr{ErrStage, errors.New("unknown registry: " + string(registryID))}
-				}
-
-				_, err = registry.ReadTagsFrom(r)
-				if err != nil {
-					return ConfigErr{ErrStage, err}
-				}
+			if err := c.ReadUpdateTags(p.Data); err != nil {
+				return ConfigErr{"update tags", err}
 			}
 
 		case packetid.ClientboundConfigurationSelectKnownPacks:
@@ -304,38 +274,4 @@ func (d *DefaultConfigHandler) PopAllResourcePack() {
 
 func (d *DefaultConfigHandler) SelectDataPacks(packs []DataPack) []DataPack {
 	return []DataPack{}
-}
-
-type idleTagsDecoder struct{}
-
-func (idleTagsDecoder) ReadFrom(r io.Reader) (int64, error) {
-	var count pk.VarInt
-	var tag pk.Identifier
-	var length pk.VarInt
-	n, err := count.ReadFrom(r)
-	if err != nil {
-		return n, err
-	}
-	for i := 0; i < int(count); i++ {
-		var n1, n2, n3 int64
-		n1, err = tag.ReadFrom(r)
-		if err != nil {
-			return n + n1, err
-		}
-		n2, err = length.ReadFrom(r)
-		if err != nil {
-			return n + n1 + n2, err
-		}
-		n += n1 + n2
-
-		var id pk.VarInt
-		for i := 0; i < int(length); i++ {
-			n3, err = id.ReadFrom(r)
-			if err != nil {
-				return n + n3, err
-			}
-			n += n3
-		}
-	}
-	return n, nil
 }

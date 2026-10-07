@@ -22,7 +22,9 @@ type Client struct {
 	Name       string
 	UUID       uuid.UUID
 	Registries registry.Registries
-	Cookies    map[string][]byte
+	// Tags are the tags the server sent, of every registry, by id.
+	Tags    Tags
+	Cookies map[string][]byte
 
 	// Ingame packet handlers
 	Events Events

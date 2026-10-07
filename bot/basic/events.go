@@ -41,9 +41,12 @@ type EventsListener struct {
 	// Teleported event is called when the server think the player position in the client side is wrong,
 	// and send a ClientboundPlayerPosition packet to correct the client.
 	//
-	// Typically, you need to do two things in this handler:
-	// - Update the player's position and rotation you tracked to the correct position.
-	// - Call [Player.AcceptTeleportation] to send a teleport confirmation packet to the server.
+	// The teleport is already applied to [Player.Position] when this handler runs
+	// (relative coordinates resolved). A bot with a control.Controller has it
+	// confirmed by the controller: do not confirm it again (the server takes a
+	// second confirmation of the same id as an invalid move and disconnects).
+	// Without a controller, call [Player.AcceptTeleportation] here: it sends the
+	// confirmation, with that position from 26.3 on.
 	//
 	// Before you confirm the teleportation, the server will not accept any player motion packets.
 	//

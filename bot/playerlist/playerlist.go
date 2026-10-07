@@ -7,6 +7,8 @@
 package playerlist
 
 import (
+	"sync"
+
 	"github.com/google/uuid"
 
 	"github.com/mj41/go-mc26-kit/bot"
@@ -20,7 +22,21 @@ import (
 )
 
 type PlayerList struct {
+	// mu is held while a packet changes PlayerInfos; ByName reads under it.
+	mu          sync.RWMutex
 	PlayerInfos map[uuid.UUID]*PlayerInfo
+}
+
+// ByName returns the UUID of the listed player name.
+func (pl *PlayerList) ByName(name string) (uuid.UUID, bool) {
+	pl.mu.RLock()
+	defer pl.mu.RUnlock()
+	for id, p := range pl.PlayerInfos {
+		if p.Name == name {
+			return id, true
+		}
+	}
+	return uuid.UUID{}, false
 }
 
 func New(c *bot.Client) *PlayerList {
@@ -48,6 +64,8 @@ func (pl *PlayerList) handlePlayerInfoUpdatePacket(p pk.Packet) error {
 		return err
 	}
 	actions := update.Actions
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
 	for i := range update.Entries {
 		e := &update.Entries[i]
 		id := uuid.UUID(e.ProfileID)
@@ -108,6 +126,8 @@ func (pl *PlayerList) handlePlayerInfoRemovePacket(p pk.Packet) error {
 	if err := p.Scan(&remove); err != nil {
 		return err
 	}
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
 	for _, id := range remove.ProfileIds {
 		delete(pl.PlayerInfos, uuid.UUID(id))
 	}
