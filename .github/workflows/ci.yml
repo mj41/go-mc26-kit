@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         # every supported library version: the kit's sources build against each
-        lib: ["v0.261.0", "v0.262.0", "v0.263.0"]
+        lib: ["v0.261.1", "v0.262.1", "v0.263.1"]
     env:
       GOFLAGS: -mod=mod # go.sum may lack a library line until its tag is public
     steps:
