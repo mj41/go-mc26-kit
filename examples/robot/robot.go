@@ -177,10 +177,11 @@ type robot struct {
 	phases                   []phase // the times of day it has seen, as they came
 	ctx                      context.Context
 	food                     atomic.Int32
-	health                   atomic.Uint32 // float32 bits, the last health the server sent
-	lastHurt                 atomic.Int64  // when it was last hurt, Unix milliseconds
-	wardenAt                 time.Time     // when it last saw a warden (no mine that night)
-	fleeing                  bool          // going away from a warden
+	health                   atomic.Uint32       // float32 bits, the last health the server sent
+	lastHurt                 atomic.Int64        // when it was last hurt, Unix milliseconds
+	leftAlone                map[int32]time.Time // mobs a defence could not reach, till when they are left (defend)
+	wardenAt                 time.Time           // when it last saw a warden (no mine that night)
+	fleeing                  bool                // going away from a warden
 }
 
 func main() {

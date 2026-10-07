@@ -404,7 +404,7 @@ func cmdGoto(r *robot, args []string) (string, error) {
 	// the ground it last stood on: a drop of more than three under it is a
 	// fall (off an edge, pushed), the path never drops more
 	var top world.BlockPos
-	grounded, falls := false, 0
+	grounded, falls, fights := false, 0, 0
 	defer func() {
 		if len(overTree) > 0 {
 			plan("goto %v: over a tree, %d cells", goal, len(overTree))
@@ -441,7 +441,9 @@ func cmdGoto(r *robot, args []string) (string, error) {
 			}
 			if t%2 == 1 && r.defend() { // attacked on the way: fought, then on
 				r.walker.Goto(goal)
-				deadline = deadline.Add(30 * time.Second)
+				if fights++; fights <= 4 { // more time for the walk, not without end
+					deadline = deadline.Add(30 * time.Second)
+				}
 			}
 		}
 		st = r.walker.Status()

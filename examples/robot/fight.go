@@ -336,6 +336,11 @@ func (r *robot) defend() bool {
 		if e.DistanceSqr(p.X, p.Y, p.Z) > 36 && !hurt && !creeperNear {
 			continue
 		}
+		// one a defence could not reach (a spider in the cave under the
+		// stairs) and that has not hurt it since: left alone a while
+		if time.Now().Before(r.leftAlone[e.ID]) && !hurt {
+			continue
+		}
 		// a creeper is not fought but left: one that reaches it blows up
 		// for more than its whole health
 		if e.Type == "minecraft:creeper" {
@@ -359,8 +364,22 @@ func (r *robot) defend() bool {
 			return true
 		}
 		log.Printf("robot: %s at %.1f %.1f %.1f: defending", e.Type, e.X, e.Y, e.Z)
+		began := time.Now()
 		killed, err := r.fightWhere(max(10, math.Sqrt(e.DistanceSqr(p.X, p.Y, p.Z))+2), 30*time.Second, func(e entities.Entity) bool { return hostileType(e.Type) && e.Type != "minecraft:creeper" }, 0)
 		log.Printf("robot: defended: killed=%d %v", killed, err)
+		if killed == 0 && time.UnixMilli(r.lastHurt.Load()).Before(began) {
+			// none killed, not hurt: the ones about are out of its reach —
+			// a minute on with its work, not another fight with them
+			if r.leftAlone == nil {
+				r.leftAlone = map[int32]time.Time{}
+			}
+			q := r.player.Position()
+			for _, m := range r.entities.Nearby(q.X, q.Y, q.Z, 12) {
+				if hostileType(m.Type) {
+					r.leftAlone[m.ID] = time.Now().Add(time.Minute)
+				}
+			}
+		}
 		events.emit("fight", map[string]any{"against": e.Type, "killed": killed})
 		// hungry: what they dropped (a zombie's flesh is food, at a pinch);
 		// without a rod yet: a spider's string
