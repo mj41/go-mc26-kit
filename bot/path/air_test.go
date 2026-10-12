@@ -179,8 +179,113 @@ func TestWalkUnderWaterWithLittleAir(t *testing.T) {
 	if least < 20 {
 		t.Errorf("the air went down to %d on the way out: it should have kept some", least)
 	}
+	if eyes := (&Graph{World: w}).water(world.BlockPos{X: int(p.X), Y: int(p.Y + eyeHeight), Z: int(p.Z)}); eyes {
+		t.Errorf("the walk ended with the eyes in water, at %+v", p)
+	}
 	st, p, _ = walkAir(t, w, from, room, 1500, 150)
 	if !strings.Contains(st, "under water too long") {
 		t.Errorf("the room twenty blocks on, with 150 ticks of air: %q at %+v, want the air said", st, p)
+	}
+}
+
+// A goal under water leaves the body there with what is left of its air: the way out has to fit as well as the
+// way in. A dead end 14 blocks long: a goal 6 in is planned (66 ticks in, 66 out, 225 to spend); 12 in is not
+// (132 + 132), though the way in alone fits; with the far end open to the dry room the nearest way out is 3
+// blocks on, and it is planned; a body that stays at the goal (Linger, a block to dig) counts that too.
+func TestAirGoalUnderWaterNeedsTheWayOut(t *testing.T) {
+	stone := block.ToStateID[block.Stone{}]
+	room := func(sealed bool) testWorld {
+		w, _ := floodedRoom(t, 14)
+		if sealed {
+			w.fill(3+14, -60, 0, 3+14, -59, 0, stone)
+		}
+		return w
+	}
+	at := func(i int) world.BlockPos { return world.BlockPos{X: 3 + i, Y: -60, Z: 0} } // the i-th cell of the passage
+	try := func(w testWorld, goal world.BlockPos, linger int) error {
+		g := &Graph{World: w, Tags: ladderTags{}, Linger: linger}
+		start, _ := g.Start(0.5, -60, 0.5)
+		_, err := g.Find(start, goal, 30000)
+		return err
+	}
+	if err := try(room(true), at(5), 0); err != nil {
+		t.Errorf("a goal 6 blocks into a dead end: %v", err)
+	}
+	err := try(room(true), at(11), 0)
+	var np *NoPathError
+	if !errors.As(err, &np) || !np.Air {
+		t.Errorf("a goal 12 blocks into a dead end, the way out too long: %v", err)
+	}
+	if err := try(room(false), at(11), 0); err != nil {
+		t.Errorf("the same goal with the far end open to the dry room: %v", err)
+	}
+	if err := try(room(true), at(5), 150); err == nil {
+		t.Error("a goal 6 blocks in where the body stays 150 ticks (225 to spend, 132 to go and come back): planned")
+	}
+	// the goal with the head out needs no way out: the pocket of air at the end of a dead end
+	w := room(true)
+	w.fill(3+12, -59, 0, 3+13, -59, 0, block.ToStateID[block.Air{}])
+	if err := try(w, at(12), 0); err != nil {
+		t.Errorf("a goal in a pocket of air at the end of the passage: %v", err)
+	}
+}
+
+// NearestAir: the nearest place to breathe from the middle of a long passage is the pocket 4 blocks ahead, not
+// the mouth 17 blocks back; with air for no more than the way to it, none.
+func TestAirNearestAir(t *testing.T) {
+	w, _ := floodedRoom(t, 30, [2]int{20, 25})
+	g := &Graph{World: w, Tags: ladderTags{}}
+	here, ok := g.Start(3+16+0.5, -60, 0.5)
+	if !ok || !g.submerged(here) {
+		t.Fatalf("no start under water: %+v %v", here, ok)
+	}
+	n, ticks, ok := g.NearestAir(here, FullAir)
+	if !ok || n.Pos.X != 3+20 {
+		t.Fatalf("the nearest air: %+v %d %v, want the pocket at x %d", n, ticks, ok, 3+20)
+	}
+	if ticks < 4*swimTicks || ticks > 6*swimTicks {
+		t.Errorf("the pocket costs %d ticks, want about 4 blocks (%d)", ticks, 4*swimTicks)
+	}
+	if _, _, ok := g.NearestAir(here, 3*swimTicks); ok {
+		t.Error("air found in less than the way to it")
+	}
+	if n, ticks, ok := g.NearestAir(n, 0); !ok || ticks != 0 || n.Pos.X != 3+20 {
+		t.Errorf("a body that breathes is its own nearest air: %+v %d %v", n, ticks, ok)
+	}
+}
+
+// AirNeed says what the walk in hand needs: nothing before a walk, the swim's air while it is under way (the
+// passage is 12 blocks: a hundred and some ticks), nothing after.
+func TestWalkerAirNeed(t *testing.T) {
+	w, goal := floodedRoom(t, 12)
+	bp := basic.NewPlayer(bot.NewClient(), basic.DefaultSettings, basic.EventsListener{})
+	bp.SetPosition(basic.Position{X: 0.5, Y: -60, Z: 0.5})
+	walker := &Walker{Graph: &Graph{World: w, Tags: ladderTags{}}, MaxNodes: 30000}
+	mover := &physics.Mover{World: w, Tags: ladderTags{}}
+	var s control.State
+	if need, walking := walker.AirNeed(); need != 0 || walking {
+		t.Errorf("before a walk: %d %v", need, walking)
+	}
+	walker.Goto(goal)
+	most := 0
+	for range 1500 {
+		walker.Think(&s, bp)
+		walker.waitSearch()
+		mover.Step(&s, bp)
+		if need, walking := walker.AirNeed(); walking {
+			most = max(most, need)
+		}
+		if walker.Status() != "walking" {
+			break
+		}
+	}
+	if st := walker.Status(); st != "arrived" {
+		t.Fatalf("the walk: %s", st)
+	}
+	if most < 10*swimTicks || most > 16*swimTicks {
+		t.Errorf("the walk needed %d ticks of air at most, want about a passage of 12 (%d)", most, 12*swimTicks)
+	}
+	if need, walking := walker.AirNeed(); need != 0 || walking {
+		t.Errorf("after the walk: %d %v", need, walking)
 	}
 }

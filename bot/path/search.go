@@ -24,6 +24,7 @@ type NoPathError struct {
 	Closest  Node
 	Back     Node
 	Searched int
+	Labels   int // the ways to places kept (more than Searched where water gives a place several: air.go)
 	Limit    bool
 	From     world.BlockPos
 	// Air: a step was refused for want of air (the way through water was longer than the air lasts): with
@@ -84,6 +85,8 @@ func (g *Graph) FindContext(ctx context.Context, start Node, goal world.BlockPos
 	}
 	budget := g.airBudget()
 	airRefused := false
+	labels := 1
+	exits := map[world.BlockPos]int{} // the ticks from a place to air, once asked (air.go)
 	root := &label{node: start}
 	seen := map[world.BlockPos][]*label{start.Pos: {root}}
 	open := &queue{{r: root, f: h(start.Pos)}}
@@ -102,7 +105,9 @@ func (g *Graph) FindContext(ctx context.Context, start Node, goal world.BlockPos
 		if hc := h(cur); hc < closestH {
 			closest, closestH = r.node, hc
 		}
-		if reached(cur) {
+		if reached(cur) && r.parent != nil && !g.canLeave(r.node, budget-r.used, exits) {
+			airRefused = true // the goal is under water and the air does not last the way out (air.go)
+		} else if reached(cur) {
 			var out []Node
 			for ; r.parent != nil; r = r.parent {
 				out = append(out, r.node)
@@ -121,7 +126,7 @@ func (g *Graph) FindContext(ctx context.Context, start Node, goal world.BlockPos
 			cost := r.g + e.cost
 			better := true
 			for _, o := range seen[e.to.Pos] {
-				if !o.dead && o.g <= cost && o.used <= used {
+				if !o.dead && o.g <= cost && o.used/airBucket <= used/airBucket {
 					better = false
 					break
 				}
@@ -130,12 +135,13 @@ func (g *Graph) FindContext(ctx context.Context, start Node, goal world.BlockPos
 				continue
 			}
 			for _, o := range seen[e.to.Pos] {
-				if o.g >= cost && o.used >= used {
+				if o.g >= cost && o.used/airBucket >= used/airBucket {
 					o.dead = true
 				}
 			}
 			nr := &label{node: e.to, g: cost, used: used, parent: r}
 			seen[e.to.Pos] = append(seen[e.to.Pos], nr)
+			labels++
 			heap.Push(open, item{r: nr, f: cost + h(e.to.Pos)})
 		}
 	}
@@ -143,13 +149,13 @@ func (g *Graph) FindContext(ctx context.Context, start Node, goal world.BlockPos
 		// a step was refused for want of air: was that why there is no way? With no limit on the air, is there one?
 		free := *g
 		free.noAirLimit = true
-		_, err := free.FindContext(ctx, start, goal, maxNodes)
+		_, err := free.FindContext(ctx, start, goal, min(maxNodes, airAskNodes))
 		airRefused = err == nil
 	} else {
 		airRefused = false
 	}
 	back := g.backNearest(start, h, maxNodes)
-	return nil, &NoPathError{Closest: closest, Back: back, Searched: n, Limit: open.Len() > 0, From: start.Pos, Air: airRefused}
+	return nil, &NoPathError{Closest: closest, Back: back, Searched: n, Labels: labels, Limit: open.Len() > 0, From: start.Pos, Air: airRefused}
 }
 
 // backNearest is the place nearest the goal (by h) of those reached from
@@ -198,6 +204,10 @@ func (g *Graph) edgeBack(b, a Node) bool {
 	}
 	return false
 }
+
+// airAskNodes bounds the search that asks whether the air alone refused the way: a plan refused for the air is
+// asked again, with no limit on the air, at most this many places (a bot in a big flooded cave replans often).
+const airAskNodes = 20000
 
 // label is a way to a place: the cost so far and the air spent (used, ticks; air.go). The labels of a place are
 // the ways to it that neither cost more nor have spent more than another; with no water there is one each.

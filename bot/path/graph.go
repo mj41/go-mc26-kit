@@ -35,6 +35,9 @@ type Graph struct {
 	// Air, when set, is the air supply the walk starts with, in ticks (300 is full): the search plans no way
 	// through more water than that air lasts (air.go). Unset: a full supply.
 	Air func() int
+	// Linger is the ticks the body stays at a goal under water (a block dug on a lake's bed): the search counts
+	// them, with the way out to air, in the budget (air.go).
+	Linger int
 
 	noAirLimit bool // a search that asks whether the air alone refused the way (search.go)
 }

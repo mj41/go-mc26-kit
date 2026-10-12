@@ -51,7 +51,8 @@ type Walker struct {
 	retryAt   int            // a follow whose target is unreachable searches again at this tick
 	refresh   bool           // a follow's goal moved: a new search starts while the path in hand is still walked
 
-	air     int // the air supply left, in ticks, as the walker counts it (air.go): 300 at the first tick, less under water
+	pos     basic.Position // where the body was at the last tick
+	air     int            // the air supply left, in ticks, as the walker counts it (air.go): 300 at the first tick, less under water
 	airSeen bool
 }
 
@@ -232,11 +233,11 @@ func (w *Walker) Think(s *control.State, bp *basic.Player) {
 		return
 	}
 
-	if left := w.airLeft(); left < FullAir/2 {
-		// the air is going: the way on must not spend more of it than is left (it may have gone slower than
+	if left := w.airLeft(); left < FullAir {
+		// the air is not full: the way on must not spend more of it than is left (it may have gone slower than
 		// the plan counted, or the body been pushed back); else it is planned again, which finds the way out
-		// to breathe or no way (air.go)
-		if start, ok := w.Graph.Start(pos.X, pos.Y, pos.Z); ok && w.Graph.airNeed(start, w.path[w.i:]) > left {
+		// to breathe or no way (air.go). The next hundred nodes: the run in the water is within them.
+		if start, ok := w.Graph.Start(pos.X, pos.Y, pos.Z); ok && w.Graph.airNeed(start, w.path[w.i:min(w.i+100, len(w.path))]) > left {
 			w.path = nil
 			s.Input = control.Input{Jump: w.inWater(bp), Shift: w.Sneak}
 			return
@@ -364,9 +365,29 @@ func (w *Walker) Air() int {
 	return w.air
 }
 
+// AirNeed is the air, in ticks, the way on of the walk in hand spends before it is done — the most the swim
+// takes over what the places to breathe on it give back, counted as the search counts (air.go) — and whether
+// a walk is in progress with a path. 0: the way has no water over the head. A brain that goes up for air when it
+// is low asks this: a plan it made may need more than its usual threshold leaves, and a body that stops half
+// way to swim up goes into the roof the plan counted on (a test run of a bot that drowned this way).
+func (w *Walker) AirNeed() (int, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.job.active || w.i >= len(w.path) {
+		return 0, false
+	}
+	pos := w.pos
+	start, ok := w.Graph.Start(pos.X, pos.Y, pos.Z)
+	if !ok {
+		return 0, true
+	}
+	return w.Graph.airNeed(start, w.path[w.i:]), true
+}
+
 // breathe counts the air at a tick as the game does: a tick with the eyes in water takes one, a tick out of it
 // gives four back. The caller holds w.mu.
 func (w *Walker) breathe(pos basic.Position) {
+	w.pos = pos
 	if !w.airSeen {
 		w.air, w.airSeen = FullAir, true
 	}
