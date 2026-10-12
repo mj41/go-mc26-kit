@@ -370,8 +370,7 @@ func (g *Game) itemsTick() error {
 			}
 			it.vx, it.vy, it.vz = it.vx*0.98, it.vy*fall, it.vz*0.98
 			if it.age%10 == 0 { // (where it floats told, as the game's tracker tells a moving item)
-				if err := g.S.Send(play.EntityPositionSync{ID: pk.VarInt(it.id), Position: types.PositionPath{Type: types.PositionPathTypeLinear,
-					X: pk.Double(it.x), Y: pk.Double(it.y), Z: pk.Double(it.z)}}); err != nil {
+				if err := g.S.Send(positionSync(it.id, it.x, it.y, it.z, 0, 0, false)); err != nil {
 					return err
 				}
 			}

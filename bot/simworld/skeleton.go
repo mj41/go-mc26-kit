@@ -216,8 +216,7 @@ func (g *Game) arrowsTick() error {
 
 // tellArrow tells the client where the arrow is and how fast it goes.
 func (g *Game) tellArrow(a *arrow) error {
-	err := g.S.Send(play.EntityPositionSync{ID: pk.VarInt(a.id), Position: types.PositionPath{Type: types.PositionPathTypeLinear,
-		X: pk.Double(a.x), Y: pk.Double(a.y), Z: pk.Double(a.z)}, YRot: pk.Float(math.Atan2(a.vx, a.vz) * 180 / math.Pi), OnGround: pk.Boolean(a.inGround)})
+	err := g.S.Send(positionSync(a.id, a.x, a.y, a.z, math.Atan2(a.vx, a.vz)*180/math.Pi, 0, a.inGround))
 	if err != nil {
 		return err
 	}

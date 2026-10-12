@@ -188,7 +188,8 @@ func (g *Game) explode(c [3]float64, radius float64, src *mob) error {
 	}
 	// told: the explosion, the player's push in it
 	tell := play.Explode{Center: types.Vec3{X: pk.Double(c[0]), Y: pk.Double(c[1]), Z: pk.Double(c[2])}, Radius: pk.Float(radius),
-		BlockCount: pk.Int(len(order)), PlaySound: true}
+		BlockCount: pk.Int(len(order))}
+	tell = withSound(tell)
 	if knock != nil {
 		tell.PlayerKnockback = pk.Option[types.Vec3, *types.Vec3]{Has: true, Val: types.Vec3{X: pk.Double(knock[0]), Y: pk.Double(knock[1]), Z: pk.Double(knock[2])}}
 	}

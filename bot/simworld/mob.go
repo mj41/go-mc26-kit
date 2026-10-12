@@ -314,8 +314,7 @@ func (g *Game) mobsTick() error {
 		m.vx, m.vz = stepX*drag, stepZ*drag
 		m.vy = (m.vy - 0.08) * 0.98 // (gravity after the move, as the game does)
 		if before != [3]float64{m.x, m.y, m.z} {
-			err := g.S.Send(play.EntityPositionSync{ID: pk.VarInt(m.id), Position: types.PositionPath{Type: types.PositionPathTypeLinear,
-				X: pk.Double(m.x), Y: pk.Double(m.y), Z: pk.Double(m.z)}, YRot: pk.Float(m.yaw), OnGround: pk.Boolean(m.onGround)})
+			err := g.S.Send(positionSync(m.id, m.x, m.y, m.z, float64(m.yaw), 0, m.onGround))
 			if err != nil {
 				return err
 			}
