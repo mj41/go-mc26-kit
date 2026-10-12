@@ -34,6 +34,7 @@ type Hands struct {
 	job         job
 	attackTicks int          // Player.attackStrengthTicker: ticks since the last attack
 	swungAt     atomic.Int64 // when the arm last swung (Swinging), Unix nanoseconds
+	swings      atomic.Int64 // how many times it swung (Swings)
 }
 
 // job is the action in progress; its tick returns true when it is over.
@@ -130,8 +131,31 @@ func (h *Hands) Swinging() bool {
 	return time.Since(time.Unix(0, h.swungAt.Load())) < 300*time.Millisecond
 }
 
+// Swings counts its arm's swings so far (its own and the server's for a
+// use): a watcher that sees it grow knows the arm swung since it last looked.
+func (h *Hands) Swings() int64 { return h.swings.Load() }
+
+// Using is the eating or drinking going on (Eat): the ticks it has gone and
+// the ticks it takes — for a watcher to draw the hand at the mouth.
+func (h *Hands) Using() (ticks, need int, ok bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if e, is := h.job.(*eat); is && e.need > 0 {
+		return e.ticks, e.need, true
+	}
+	return 0, 0, false
+}
+
+// swungByServer notes a swing the server makes for a use that succeeded (from
+// 26.3 the client sends none: the server swings the arm for the others —
+// a block placed, a crafting table, a chest or a furnace opened, an entity
+// used), so Swinging tells it as others see it. A use that failed swings
+// nothing; the robot's uses are meant to succeed.
+func (h *Hands) swungByServer() { h.swungAt.Store(time.Now().UnixNano()); h.swings.Add(1) }
+
 func (h *Hands) swing() error {
 	h.swungAt.Store(time.Now().UnixNano())
+	h.swings.Add(1)
 	if id, ok := serverboundID("ServerboundPunch"); ok {
 		return h.C.Conn.WritePacket(pk.Marshal(id))
 	}

@@ -29,6 +29,7 @@ type Manager struct {
 	// after a click the client predicted right, none come.
 	SlotUpdates int
 	events      EventsListener
+	clicks      []Clicked // the clicks made, for a watcher (Clicks)
 	// The last received State ID from server
 	stateID int32
 }
@@ -61,6 +62,7 @@ func NewManager(c *bot.Client, e EventsListener) *Manager {
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlaySetPlayerInventory, F: m.locked(m.onSetPlayerInventory)},
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlaySetHeldSlot, F: m.locked(m.onSetHeldSlot)},
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayMerchantOffers, F: m.locked(m.onMerchantOffers)},
+		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayContainerSetData, F: m.locked(m.onSetData)},
 	)
 	return m
 }
@@ -122,6 +124,26 @@ func (m *Manager) onOpenScreen(p pk.Packet) error {
 		return Error{err}
 	}
 	id := int(os.ContainerID)
+	// one menu at a time, as the game's client has (its containerMenu
+	// replaced): a screen the server opens takes the place of the one open
+	// before, though the bot never closed that one (its job stopped while a
+	// crafting table was open) — left in the map, Open, which ranges over it,
+	// gave the old menu's slots for the new one's clicks, and a furnace was
+	// loaded with dirt where the old layout had raw iron
+	for old, c := range m.Screens {
+		if old == 0 || old == id {
+			continue
+		}
+		delete(m.Screens, old)
+		if err := c.onClose(); err != nil {
+			return Error{err}
+		}
+		if m.events.Close != nil {
+			if err := m.events.Close(old); err != nil {
+				return Error{err}
+			}
+		}
+	}
 	m.Screens[id] = &Menu{ID: id, Type: menuName(os.Type), Title: chat.Message(os.Title)}
 	if m.events.Open != nil {
 		if err := m.events.Open(id, int32(os.Type), chat.Message(os.Title)); err != nil {

@@ -51,6 +51,8 @@ func (i *interact) tick(h *Hands, s *control.State, bp *basic.Player) bool {
 		Location: types.LpVec3{X: 0, Y: 0.5, Z: 0}, UsingSecondaryAction: pk.Boolean(s.Input.Shift)})
 	if err == nil && version.ProtocolVersion < 777 {
 		err = h.swing()
+	} else if err == nil {
+		h.swungByServer()
 	}
 	i.done(err)
 	return true

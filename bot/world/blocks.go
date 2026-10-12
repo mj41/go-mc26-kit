@@ -94,7 +94,10 @@ func (w *World) handleBlockUpdate(packet pk.Packet) error {
 		return err
 	}
 	pos, state := BlockPos{u.Pos.X, u.Pos.Y, u.Pos.Z}, block.StateID(u.BlockState)
-	if w.SetBlock(pos, state) && w.events.BlockChange != nil {
+	w.mu.Lock()
+	changed := w.serverBlock(pos, state) // a block the client predicted: kept till the ack
+	w.mu.Unlock()
+	if changed && w.events.BlockChange != nil {
 		w.events.BlockChange(pos, state)
 	}
 	return nil
@@ -120,7 +123,7 @@ func (w *World) handleSectionBlocksUpdate(packet pk.Packet) error {
 		c := int64(ch)
 		rel := c & 0xfff
 		pos, state := BlockPos{sx<<4 | int(rel>>8&15), sy<<4 | int(rel&15), sz<<4 | int(rel>>4&15)}, block.StateID(c>>12)
-		if w.setBlock(pos, state) && w.events.BlockChange != nil {
+		if w.serverBlock(pos, state) && w.events.BlockChange != nil {
 			told = append(told, change{pos, state})
 		}
 	}

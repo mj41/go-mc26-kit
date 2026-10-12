@@ -1,6 +1,8 @@
 package screen
 
 import (
+	"maps"
+
 	"github.com/mj41/go-mc26/chat"
 	"github.com/mj41/go-mc26/data/constants"
 	"github.com/mj41/go-mc26/data/item"
@@ -21,6 +23,10 @@ type Menu struct {
 	// Offers are a merchant's trades (ClientboundMerchantOffers), for a
 	// villager's or a wandering trader's menu.
 	Offers []types.MerchantOffer
+	// Data are the menu's data values (ClientboundContainerSetData), by
+	// index: a furnace's lit time, lit duration, cooking progress and cooking
+	// total time (0–3), what its screen draws the flame and the arrow from.
+	Data map[int]int
 }
 
 func (m *Menu) onSetSlot(i int, s Slot) error {
@@ -94,6 +100,7 @@ func (m *Manager) Open() (Menu, bool) {
 			cp := *menu
 			cp.Slots = append([]Slot(nil), menu.Slots...)
 			cp.Offers = append([]types.MerchantOffer(nil), menu.Offers...)
+			cp.Data = maps.Clone(menu.Data)
 			return cp, true
 		}
 	}
@@ -127,6 +134,7 @@ func (m *Manager) Close(id int) error {
 func (m *Manager) Click(id, slot, button int, mode types.ContainerInput) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.note(Clicked{ID: id, Slot: slot, Button: button, Mode: mode})
 	slots := m.slots(id)
 	changed := ChangedSlots{}
 	if mode == types.ContainerInputPickup && slot >= 0 && slot < len(slots) {
@@ -140,6 +148,55 @@ func (m *Manager) Click(id, slot, button int, mode types.ContainerInput) error {
 		m.Cursor = nc
 	}
 	return m.containerClick(id, slot, button, mode, changed, &m.Cursor)
+}
+
+// Clicked is a click made in a menu, or a recipe the server was asked to
+// place in its grid (Recipe, the item it makes): what a person at the screen
+// would see the cursor do, for a watcher.
+type Clicked struct {
+	ID, Slot, Button int
+	Mode             types.ContainerInput
+	Recipe           string
+}
+
+// note keeps a click for Clicks (the lock held); a watcher that never asks
+// keeps the last 64.
+func (m *Manager) note(c Clicked) {
+	m.clicks = append(m.clicks, c)
+	if len(m.clicks) > 64 {
+		m.clicks = m.clicks[len(m.clicks)-64:]
+	}
+}
+
+// NoteRecipe notes a recipe placed in menu id's grid (ServerboundPlaceRecipe)
+// for Clicks.
+func (m *Manager) NoteRecipe(id int, item string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.note(Clicked{ID: id, Slot: -1, Recipe: item})
+}
+
+// Clicks returns the clicks made since it was last asked, oldest first.
+func (m *Manager) Clicks() []Clicked {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.clicks
+	m.clicks = nil
+	return c
+}
+
+func (m *Manager) onSetData(p pk.Packet) error {
+	var d play.ContainerSetData
+	if err := p.Scan(&d); err != nil {
+		return Error{err}
+	}
+	if menu, ok := m.Screens[int(d.ContainerID)].(*Menu); ok {
+		if menu.Data == nil {
+			menu.Data = map[int]int{}
+		}
+		menu.Data[int(d.ID)] = int(d.Value)
+	}
+	return nil
 }
 
 // pickup is a pick-up click's effect on a slot and the cursor.

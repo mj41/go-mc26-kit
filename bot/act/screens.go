@@ -32,6 +32,26 @@ func itemName(id pk.VarInt) string {
 	return ""
 }
 
+// ready waits (40 ticks at most) till the open menu's contents have come: a
+// menu the server has just opened has no slots for a tick or two, and a
+// click then was made by the inventory menu's layout — raw iron picked from
+// the wrong slot, the furnace given its coal alone; a craft made in the
+// inventory's 2×2 ("the server put no … in the result slot").
+func (s *Screens) ready(ctx context.Context) error {
+	for t := 0; ; t++ {
+		m, ok := s.Screens.Open()
+		if !ok || m.PlayerStart() >= 0 {
+			return nil
+		}
+		if t >= 40 {
+			return errors.New("act: the open menu's contents never came")
+		}
+		if err := s.Ctl.WaitTicks(ctx, 1); err != nil {
+			return err
+		}
+	}
+}
+
 // current is the open menu's id and slots: the open container, or the
 // inventory menu (0) when none is open.
 func (s *Screens) current() (int, []screen.Slot, int) {
@@ -61,10 +81,13 @@ func (s *Screens) Count(item string) int {
 // fill the grid with one set (ServerboundPlaceRecipe), waits for the result,
 // and shift-clicks it into the inventory. It returns how many it made.
 func (s *Screens) Craft(ctx context.Context, item string, n int) (int, error) {
+	if err := s.ready(ctx); err != nil {
+		return 0, err
+	}
 	id, _, _ := s.current()
 	rs := s.Book.For(item)
-	if len(rs) == 0 {
-		return 0, fmt.Errorf("act: no recipe for %s in the book", item)
+	if len(rs) == 0 { // not unlocked (yet): made by hand from the data pack's recipe (craftpack.go)
+		return s.craftFromPack(ctx, id, item, n)
 	}
 	made := 0
 	for made < n {
@@ -102,6 +125,7 @@ func (s *Screens) craftOnce(ctx context.Context, id int, r recipes.Recipe) (int,
 	if err := s.C.Conn.WritePacket(pk.Marshal(pr.PacketID(), pr)); err != nil {
 		return 0, err
 	}
+	s.Screens.NoteRecipe(id, r.Result)
 	for t := 0; ; t++ {
 		if err := s.Ctl.WaitTicks(ctx, 1); err != nil {
 			return 0, err
@@ -158,6 +182,9 @@ func (s *Screens) Move(ctx context.Context, item string, toContainer bool) (int,
 // put moves the whole stack of item at its first slot in the player's part
 // of the menu into slot to, by two pick-up clicks.
 func (s *Screens) put(ctx context.Context, id int, item string, to int) error {
+	if err := s.ready(ctx); err != nil {
+		return err
+	}
 	_, slots, start := s.current()
 	for i := start; i < len(slots); i++ {
 		if slots[i].Count > 0 && itemName(slots[i].Item) == item {
@@ -179,6 +206,9 @@ func (s *Screens) put(ctx context.Context, id int, item string, to int) error {
 // putN puts n of item into slot to of the open menu, as a person does: the
 // stack picked up, one right click on the slot for each, the rest put back.
 func (s *Screens) putN(ctx context.Context, id int, item string, n, to int) error {
+	if err := s.ready(ctx); err != nil {
+		return err
+	}
 	_, slots, start := s.current()
 	for i := start; i < len(slots) && n > 0; i++ {
 		if slots[i].Count <= 0 || itemName(slots[i].Item) != item {
@@ -206,7 +236,7 @@ func (s *Screens) putN(ctx context.Context, id int, item string, n, to int) erro
 			return err
 		}
 		n -= k
-		_, slots, start = s.current()
+		_, slots, _ = s.current() // its counts now; the same menu, the same start
 	}
 	if n > 0 {
 		return fmt.Errorf("act: %d %s short", n, item)
@@ -234,6 +264,9 @@ func (s *Screens) Load(ctx context.Context, input string, n int, fuel string, fu
 // TakeOutput shift-clicks what the open furnace has made into the inventory
 // and returns how many.
 func (s *Screens) TakeOutput(ctx context.Context) (int, error) {
+	if err := s.ready(ctx); err != nil {
+		return 0, err
+	}
 	m, ok := s.Screens.Open()
 	if !ok || m.Type != "minecraft:furnace" && m.Type != "minecraft:smoker" && m.Type != "minecraft:blast_furnace" {
 		return 0, errors.New("act: no furnace is open")
@@ -249,6 +282,25 @@ func (s *Screens) TakeOutput(ctx context.Context) (int, error) {
 	return got, s.Ctl.WaitTicks(ctx, 4)
 }
 
+// furnaceStall is how many of the client's ticks a furnace may show no change
+// (no result, no progress, its fire the same) before it is taken as not
+// working; furnaceMost is the most an item is waited for (the game's 200
+// ticks five times over: a server at a fifth of its speed).
+const furnaceStall, furnaceMost = 200, 1000
+
+// furnaceState is what changes while a furnace works: its result's count,
+// its cooking progress, its fire's ticks left.
+func furnaceState(s *Screens, id int) [3]int {
+	var st [3]int
+	if slots := s.Screens.Slots(id); len(slots) > 2 {
+		st[0] = int(slots[2].Count)
+	}
+	if m, ok := s.Screens.Open(); ok && m.ID == id {
+		st[1], st[2] = m.Data[2], m.Data[0]
+	}
+	return st
+}
+
 // Smelt puts input and fuel in the open furnace, waits for n results and
 // shift-clicks them into the inventory.
 func (s *Screens) Smelt(ctx context.Context, input, fuel string, n int) (int, error) {
@@ -262,6 +314,13 @@ func (s *Screens) Smelt(ctx context.Context, input, fuel string, n int) (int, er
 	if err := s.put(ctx, m.ID, fuel, 1); err != nil {
 		return 0, err
 	}
+	// the furnace cooks on the server's ticks, not the client's: a server
+	// behind the game's speed (a busy node) cooks slower, so it is waited for
+	// as long as it works — its results, its cooking progress or its fire
+	// changing (the menu's data: 0 the fire's ticks left, 2 the progress) —
+	// and given up on when nothing changed for furnaceStall of the client's
+	// ticks (no fuel, nothing it smelts), or at n times furnaceMost
+	last, still := furnaceState(s, m.ID), 0
 	for t := 0; ; t += 10 {
 		if err := s.Ctl.WaitTicks(ctx, 10); err != nil {
 			return 0, err
@@ -269,7 +328,12 @@ func (s *Screens) Smelt(ctx context.Context, input, fuel string, n int) (int, er
 		if slots := s.Screens.Slots(m.ID); len(slots) > 2 && int(slots[2].Count) >= n {
 			break
 		}
-		if t > n*200+200 {
+		if now := furnaceState(s, m.ID); now != last {
+			last, still = now, 0
+		} else if still += 10; still >= furnaceStall {
+			return 0, errors.New("act: the furnace did not make enough: it stopped working")
+		}
+		if t > n*furnaceMost {
 			return 0, errors.New("act: the furnace did not make enough")
 		}
 	}
@@ -286,6 +350,9 @@ func (s *Screens) Smelt(ctx context.Context, input, fuel string, n int) (int, er
 // payment from the inventory in the menu, and the result is shift-clicked
 // out. It returns how many trades were made.
 func (s *Screens) Trade(ctx context.Context, index, times int) (int, error) {
+	if err := s.ready(ctx); err != nil {
+		return 0, err
+	}
 	m, ok := s.Screens.Open()
 	if !ok || m.Type != "minecraft:merchant" {
 		return 0, errors.New("act: no merchant is open")
@@ -348,6 +415,9 @@ func (s *Screens) Trade(ctx context.Context, index, times int) (int, error) {
 // wide, "" for an empty cell; the open crafting table's grid, or the
 // inventory's two by two. It returns how many of the result it made.
 func (s *Screens) CraftByHand(ctx context.Context, cells []string, width, times int) (int, error) {
+	if err := s.ready(ctx); err != nil {
+		return 0, err
+	}
 	id, _, start := s.current()
 	gw := 2
 	if id != 0 {

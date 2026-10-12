@@ -28,6 +28,10 @@ type Graph struct {
 	// channel: a person walks round it, not through it); one it is in
 	// already it can still leave.
 	Avoid func(world.BlockPos) bool
+	// StillWater, when set, is what a step in still water costs over dry
+	// ground (default 4: round a pond where the way round is short); a bot
+	// that swims across sets it low.
+	StillWater float64
 }
 
 // Kind is how a node is reached.
@@ -96,6 +100,36 @@ func (g *Graph) dangerous(p world.BlockPos) bool {
 	return false
 }
 
+// streamOverDrop: flowing water in the cell or under it (a body afloat on
+// it), with a side open over a drop — nothing to stand on within three below
+// it: the stream carries a body there (a bot crossed one at a waterfall's lip
+// again and again, carried each time). Still water is no such danger.
+func (g *Graph) streamOverDrop(p world.BlockPos) bool {
+	for _, c := range []world.BlockPos{p, {X: p.X, Y: p.Y - 1, Z: p.Z}} {
+		f := block.FluidOf(g.state(c))
+		if f == nil || !fluidIs(f, "water") || f.Source {
+			continue
+		}
+		for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
+			q := world.BlockPos{X: c.X + d[0], Y: c.Y, Z: c.Z + d[1]}
+			if bs, ok := g.boxes(q); !ok || len(bs) > 0 || g.water(q) {
+				continue // a wall, water on, or not loaded: not carried over
+			}
+			drop := true
+			for k := 1; k <= 3 && drop; k++ {
+				u := world.BlockPos{X: q.X, Y: q.Y - k, Z: q.Z}
+				if bs, ok := g.boxes(u); !ok || len(bs) > 0 || g.water(u) {
+					drop = false
+				}
+			}
+			if drop {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func fluidIs(f *block.Fluid, kind string) bool {
 	return f.Name == "minecraft:"+kind || f.Name == "minecraft:flowing_"+kind
 }
@@ -112,6 +146,48 @@ func (g *Graph) water(p world.BlockPos) bool {
 
 func (g *Graph) climbable(p world.BlockPos) bool {
 	return g.Tags != nil && g.Tags.BlockIn(g.state(p), "minecraft:climbable")
+}
+
+// overVine: the cell is over the top of a climbable with no collision (a
+// vine): stood "on" only as the climb leaves it — the feet a little over it,
+// nothing under them, no jump from there (a ladder is a box: its top is
+// stood on). It hung at a vine's top under a ledge a block higher for
+// minutes, the path planned up onto the ledge from there.
+func (g *Graph) overVine(p world.BlockPos) bool {
+	if g.climbable(p) || g.water(p) {
+		return false
+	}
+	below := world.BlockPos{X: p.X, Y: p.Y - 1, Z: p.Z}
+	if !g.climbable(below) {
+		return false
+	}
+	bs, ok := g.boxes(below)
+	return ok && len(bs) == 0
+}
+
+// afloat: the cell is just over water with nothing solid under it — where a
+// player swimming at the surface is, its head out. The graph stands it there
+// as on the water's top, but a floating body has nothing to jump from: no
+// step up a block onto a bank higher than the water (it swam against such a
+// bank for minutes, jumping, the path planned up from the water's top).
+func (g *Graph) afloat(p world.BlockPos) bool {
+	if g.water(p) || g.climbable(p) {
+		return false
+	}
+	below := world.BlockPos{X: p.X, Y: p.Y - 1, Z: p.Z}
+	if !g.water(below) {
+		return false
+	}
+	bs, ok := g.boxes(below)
+	if !ok {
+		return false
+	}
+	for _, b := range bs {
+		if b.MaxY-float64(below.Y) >= nearlyFull {
+			return false // a waterlogged block full enough to stand on
+		}
+	}
+	return true
 }
 
 // clear reports whether a player-sized box centred on the cell, from y0 to
@@ -167,6 +243,9 @@ func (g *Graph) floor(p world.BlockPos) (float64, bool) {
 	if !ok || g.dangerous(p) || g.lava(world.BlockPos{X: p.X, Y: p.Y + 1, Z: p.Z}) {
 		return 0, false // lava at the feet, or at the head (pouring down from above)
 	}
+	if g.streamOverDrop(p) {
+		return 0, false // a stream that carries a body over an edge
+	}
 	top := 0.0
 	for _, b := range cell {
 		// a box beside the body standing in the cell's middle (an open door,
@@ -198,6 +277,11 @@ func (g *Graph) floor(p world.BlockPos) (float64, bool) {
 			support = math.Max(support, b.MaxY-float64(below.Y))
 		}
 		switch {
+		case support > 1+1e-9:
+			// a block taller than one under it (a fence, a wall: a block and
+			// a half): stood on at its top, not at the cell's floor — the
+			// jump onto it is a block and a half, none can make it
+			f = float64(below.Y) + support
 		case support >= 1-1e-9 || g.water(below) || g.climbable(below):
 			f = float64(p.Y)
 		case support >= nearlyFull:
@@ -228,6 +312,7 @@ func (g *Graph) neighbours(n Node) []edge {
 	var out []edge
 	p := n.Pos
 	inWater := g.water(p)
+	vineTop := g.overVine(p) || g.afloat(p) // nothing under the feet to jump from
 	for _, d := range dirs {
 		diagonal := d[0] != 0 && d[1] != 0
 		if diagonal {
@@ -247,9 +332,10 @@ func (g *Graph) neighbours(n Node) []edge {
 		if inWater {
 			base *= 2
 		}
-		// up: onto a block one higher, with room above to jump
+		// up: onto a block one higher, with room above to jump (not from a
+		// vine's top: nothing under the feet there to jump from)
 		up := world.BlockPos{X: p.X + d[0], Y: p.Y + 1, Z: p.Z + d[1]}
-		if f, ok := g.floor(up); ok && f-n.Floor <= maxJump && !diagonal && g.clear(p.X, p.Z, n.Floor, f+height) && g.sweeps(p, up, f, f+height) {
+		if f, ok := g.floor(up); ok && !vineTop && f-n.Floor <= maxJump && !diagonal && g.clear(p.X, p.Z, n.Floor, f+height) && g.sweeps(p, up, f, f+height) {
 			out = append(out, edge{Node{up, f, Ascend}, base + 1})
 			continue
 		}
@@ -258,7 +344,7 @@ func (g *Graph) neighbours(n Node) []edge {
 		if f, ok := g.floor(level); ok && (diagonal || g.sweeps(p, level, math.Max(n.Floor, f), math.Max(n.Floor, f)+height)) {
 			kind, cost := Walk, base
 			if f-n.Floor > maxStep {
-				if diagonal || !g.clear(p.X, p.Z, n.Floor, f+height) {
+				if diagonal || vineTop || !g.clear(p.X, p.Z, n.Floor, f+height) {
 					continue
 				}
 				kind, cost = Ascend, base+1
@@ -381,7 +467,11 @@ func (g *Graph) wet(p world.BlockPos) float64 {
 			continue
 		}
 		if f.Source {
-			cost = math.Max(cost, 4)
+			still := 4.0
+			if g.StillWater > 0 {
+				still = g.StillWater
+			}
+			cost = math.Max(cost, still)
 		} else {
 			cost = math.Max(cost, 30) // a stream: it pushes off the way, round it almost always
 		}

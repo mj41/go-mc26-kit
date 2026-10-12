@@ -61,11 +61,28 @@ type Events struct {
 	Removed func(Entity)
 	// PickedUp: the collector picked up amount of the item entity item.
 	PickedUp func(item, collector int32, amount int)
+	// Moved: the server set the entity's position or rotation (a move,
+	// a teleport, a position sync, its head's turn; its velocity: Motion).
+	// path is where the packet takes it, step by step, as the client's
+	// interpolation plays it (26.3's stepped moves: each step with its
+	// ticks); one step with 0 ticks for a plain move (its type's own),
+	// none when only its rotation changed.
+	Moved func(e Entity, path []Step)
+	// Motion: the server set the entity's velocity (set_entity_motion).
+	Motion func(Entity)
+}
+
+// Step is a point of a move's path and the ticks the client takes to it (0:
+// its type's update interval, as for a plain move).
+type Step struct {
+	X, Y, Z float64
+	Ticks   int
 }
 
 // Manager keeps the entities of the level the player is in.
 type Manager struct {
 	events    Events
+	watchers  []Events // more listeners (Watch)
 	mu        sync.RWMutex
 	m         map[int32]*Entity
 	vehicleOf map[int32]int32 // a passenger's vehicle
@@ -92,6 +109,37 @@ func New(c *bot.Client, events Events) *Manager {
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlaySetPassengers, F: m.onPassengers},
 	)
 	return m
+}
+
+// Watch adds listeners called after the manager's own Events: a watcher
+// (one that tells what happens) beside the bot's own use.
+func (m *Manager) Watch(e Events) {
+	m.mu.Lock()
+	m.watchers = append(m.watchers, e)
+	m.mu.Unlock()
+}
+
+// each calls f with the manager's Events and each watcher's (unlocked)
+func (m *Manager) each(f func(Events)) {
+	m.mu.RLock()
+	all := append([]Events{m.events}, m.watchers...)
+	m.mu.RUnlock()
+	for _, e := range all {
+		f(e)
+	}
+}
+
+// moved tells the listeners entity id moved along path (the manager unlocked)
+func (m *Manager) moved(id int32, path []Step) {
+	e, ok := m.Get(id)
+	if !ok {
+		return
+	}
+	m.each(func(ev Events) {
+		if ev.Moved != nil {
+			ev.Moved(e, path)
+		}
+	})
 }
 
 // Get returns a copy of the entity id.
@@ -186,9 +234,12 @@ func (m *Manager) onAdd(packet pk.Packet) error {
 	m.mu.Lock()
 	m.m[e.ID] = e
 	m.mu.Unlock()
-	if m.events.Added != nil {
-		m.events.Added(*e)
-	}
+	added := *e
+	m.each(func(ev Events) {
+		if ev.Added != nil {
+			ev.Added(added)
+		}
+	})
 	return nil
 }
 
@@ -207,11 +258,13 @@ func (m *Manager) onRemove(packet pk.Packet) error {
 		m.forget(int32(id))
 	}
 	m.mu.Unlock()
-	if m.events.Removed != nil {
-		for _, e := range gone {
-			m.events.Removed(e)
+	m.each(func(ev Events) {
+		if ev.Removed != nil {
+			for _, e := range gone {
+				ev.Removed(e)
+			}
 		}
-	}
+	})
 	return nil
 }
 
@@ -246,11 +299,12 @@ func (m *Manager) onMove(hasRot bool) func(pk.Packet) error {
 			return err
 		}
 		var deltas [][3]int64
+		var ticks []int
 		var onGround bool
 		stepped := version.ProtocolVersion >= 777
 		if stepped {
 			var err error
-			if deltas, onGround, err = readSteppedDelta(r); err != nil {
+			if deltas, ticks, onGround, err = readSteppedDelta(r); err != nil {
 				return err
 			}
 		} else {
@@ -273,16 +327,23 @@ func (m *Manager) onMove(hasRot bool) func(pk.Packet) error {
 			}
 			onGround = bool(g)
 		}
+		var path []Step
 		m.with(int32(id), func(e *Entity) {
-			for _, d := range deltas {
+			for i, d := range deltas {
 				e.X, e.Y, e.Z = decode(e.base[0], d[0]), decode(e.base[1], d[1]), decode(e.base[2], d[2])
 				e.base = [3]float64{e.X, e.Y, e.Z}
+				st := Step{X: e.X, Y: e.Y, Z: e.Z}
+				if i < len(ticks) {
+					st.Ticks = ticks[i]
+				}
+				path = append(path, st)
 			}
 			if hasRot {
 				e.Yaw, e.Pitch = angle(yRot), angle(xRot)
 			}
 			e.OnGround = onGround
 		})
+		m.moved(int32(id), path)
 		return nil
 	}
 }
@@ -297,6 +358,7 @@ func (m *Manager) onRot(packet pk.Packet) error {
 	m.with(int32(mr.EntityID), func(e *Entity) {
 		e.Yaw, e.Pitch, e.OnGround = angle(mr.YRot), angle(mr.XRot), bool(mr.OnGround)
 	})
+	m.moved(int32(mr.EntityID), nil)
 	return nil
 }
 
@@ -307,30 +369,31 @@ func readShorts(r io.Reader) ([3]int64, error) {
 }
 
 // readSteppedDelta reads 26.3's packed flags (bit 0 on ground, the rest the
-// step count) and VecDelta: one linear delta, or the steps.
-func readSteppedDelta(r io.Reader) ([][3]int64, bool, error) {
+// step count) and VecDelta: one linear delta, or the steps, each with the
+// ticks it takes (none for a linear one).
+func readSteppedDelta(r io.Reader) ([][3]int64, []int, bool, error) {
 	var flags pk.VarInt
 	if _, err := flags.ReadFrom(r); err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	onGround, steps := flags&1 != 0, int(uint32(flags)>>1)
 	if steps == 0 {
 		d, err := readShorts(r)
-		return [][3]int64{d}, onGround, err
+		return [][3]int64{d}, nil, onGround, err
 	}
-	deltas := make([][3]int64, 0, steps)
+	deltas, ts := make([][3]int64, 0, steps), make([]int, 0, steps)
 	for range steps {
 		var ticks pk.VarInt
 		if _, err := ticks.ReadFrom(r); err != nil {
-			return nil, onGround, err
+			return nil, nil, onGround, err
 		}
 		d, err := readShorts(r)
 		if err != nil {
-			return nil, onGround, err
+			return nil, nil, onGround, err
 		}
-		deltas = append(deltas, d)
+		deltas, ts = append(deltas, d), append(ts, int(ticks))
 	}
-	return deltas, onGround, nil
+	return deltas, ts, onGround, nil
 }
 
 // onTeleport is ClientboundTeleportEntity: absolute or relative per axis.
@@ -356,6 +419,9 @@ func (m *Manager) onTeleport(packet pk.Packet) error {
 		e.OnGround = bool(t.OnGround)
 		e.base = [3]float64{e.X, e.Y, e.Z}
 	})
+	if e, ok := m.Get(int32(t.ID)); ok {
+		m.moved(e.ID, []Step{{X: e.X, Y: e.Y, Z: e.Z}})
+	}
 	return nil
 }
 
@@ -370,6 +436,7 @@ func (m *Manager) onPositionSync(packet pk.Packet) error {
 	var x, y, z pk.Double
 	var vx, vy, vz pk.Double
 	var hasVel bool
+	var path []Step
 	if version.ProtocolVersion >= 777 {
 		var kind pk.VarInt
 		if _, err := kind.ReadFrom(r); err != nil {
@@ -390,6 +457,7 @@ func (m *Manager) onPositionSync(packet pk.Packet) error {
 				if _, err := (pk.Tuple{&x, &y, &z, &offset}).ReadFrom(r); err != nil {
 					return err
 				}
+				path = append(path, Step{X: float64(x), Y: float64(y), Z: float64(z), Ticks: int(offset)})
 			}
 		}
 	} else {
@@ -411,6 +479,10 @@ func (m *Manager) onPositionSync(packet pk.Packet) error {
 		e.Yaw, e.Pitch, e.OnGround = float32(yRot), float32(xRot), bool(g)
 		e.base = [3]float64{e.X, e.Y, e.Z}
 	})
+	if path == nil {
+		path = []Step{{X: float64(x), Y: float64(y), Z: float64(z)}}
+	}
+	m.moved(int32(id), path)
 	return nil
 }
 
@@ -448,6 +520,13 @@ func (m *Manager) onMotion(packet pk.Packet) error {
 	m.with(int32(s.ID), func(e *Entity) {
 		e.VX, e.VY, e.VZ = s.Movement.X, s.Movement.Y, s.Movement.Z
 	})
+	if e, ok := m.Get(int32(s.ID)); ok {
+		m.each(func(ev Events) {
+			if ev.Motion != nil {
+				ev.Motion(e)
+			}
+		})
+	}
 	return nil
 }
 
@@ -457,6 +536,7 @@ func (m *Manager) onHead(packet pk.Packet) error {
 		return err
 	}
 	m.with(int32(h.EntityID), func(e *Entity) { e.HeadYaw = angle(h.YHeadRot) })
+	m.moved(int32(h.EntityID), nil)
 	return nil
 }
 
@@ -465,8 +545,10 @@ func (m *Manager) onTake(packet pk.Packet) error {
 	if err := packet.Scan(&t); err != nil {
 		return err
 	}
-	if m.events.PickedUp != nil {
-		m.events.PickedUp(int32(t.ItemID), int32(t.PlayerID), int(t.Amount))
-	}
+	m.each(func(ev Events) {
+		if ev.PickedUp != nil {
+			ev.PickedUp(int32(t.ItemID), int32(t.PlayerID), int(t.Amount))
+		}
+	})
 	return nil
 }

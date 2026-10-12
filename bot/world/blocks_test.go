@@ -35,6 +35,7 @@ func TestSectionBlocksUpdate(t *testing.T) {
 	stone := int64(block.ToStateID[block.Stone{}])
 	dirt := int64(block.ToStateID[block.Dirt{}])
 	u := play.SectionBlocksUpdate{SectionPos: pk.Long(sec)}
+	//lint:ignore SA4016 each update's four fields spelled out (state, x, z, y), the zeros too
 	u.States = append(u.States, pk.VarLong(stone<<12|15<<8|0<<4|3), pk.VarLong(dirt<<12|0<<8|15<<4|0))
 	var buf bytes.Buffer
 	if _, err := u.WriteTo(&buf); err != nil {

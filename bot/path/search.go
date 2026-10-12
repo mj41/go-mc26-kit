@@ -2,6 +2,7 @@ package path
 
 import (
 	"container/heap"
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -13,11 +14,15 @@ import (
 var ErrNoPath = errors.New("path: no way to the goal")
 
 // NoPathError is ErrNoPath with what the search found: the place reached
-// nearest the goal — where a player who must dig on starts digging — how
-// many it searched, and whether it stopped at the limit (else every place
-// reachable was searched).
+// nearest the goal — where a player who must dig on starts digging — and the
+// nearest it can walk back from (Back: reached with no one-way edge on its
+// way, a drop it could not climb or a jump over a gap: where a walk to as
+// near as the land lets ends, never a ledge down a cliff), how many it
+// searched, and whether it stopped at the limit (else every place reachable
+// was searched).
 type NoPathError struct {
 	Closest  Node
+	Back     Node
 	Searched int
 	Limit    bool
 	From     world.BlockPos
@@ -53,6 +58,12 @@ func (g *Graph) Start(x, y, z float64) (Node, bool) {
 // next to it (within reach of 1.5 blocks), as for a block to dig or a player
 // to follow.
 func (g *Graph) Find(start Node, goal world.BlockPos, maxNodes int) ([]Node, error) {
+	return g.FindContext(context.Background(), start, goal, maxNodes)
+}
+
+// FindContext is Find that ends with the context's error when ctx is done: it looks at it every 256 places
+// searched (a walker's search runs on a goroutine of its own and is cancelled by the next walk it is asked).
+func (g *Graph) FindContext(ctx context.Context, start Node, goal world.BlockPos, maxNodes int) ([]Node, error) {
 	_, goalStandable := g.floor(goal)
 	reached := func(p world.BlockPos) bool {
 		if goalStandable {
@@ -77,6 +88,9 @@ func (g *Graph) Find(start Node, goal world.BlockPos, maxNodes int) ([]Node, err
 	closest, closestH := start, h(start.Pos)
 	n := 0
 	for ; open.Len() > 0 && n < maxNodes; n++ {
+		if n&255 == 255 && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		cur := heap.Pop(open).(item).pos
 		if closed[cur] {
 			continue
@@ -106,7 +120,46 @@ func (g *Graph) Find(start Node, goal world.BlockPos, maxNodes int) ([]Node, err
 			heap.Push(open, item{pos: e.to.Pos, f: cost + h(e.to.Pos)})
 		}
 	}
-	return nil, &NoPathError{Closest: closest, Searched: n, Limit: open.Len() > 0, From: start.Pos}
+	back := g.backNearest(start, h, maxNodes)
+	return nil, &NoPathError{Closest: closest, Back: back, Searched: n, Limit: open.Len() > 0, From: start.Pos}
+}
+
+// backNearest is the place nearest the goal (by h) of those reached from
+// start by edges that each have their way back — the places it can walk to
+// and back from — searched breadth first, at most maxNodes (a search that
+// found no way: run once more over what it can come back from).
+func (g *Graph) backNearest(start Node, h func(world.BlockPos) float64, maxNodes int) Node {
+	best, bestH := start, h(start.Pos)
+	seen := map[world.BlockPos]bool{start.Pos: true}
+	queue := []Node{start}
+	for n := 0; len(queue) > 0 && n < maxNodes; n++ {
+		cur := queue[0]
+		queue = queue[1:]
+		if hc := h(cur.Pos); hc < bestH {
+			best, bestH = cur, hc
+		}
+		for _, e := range g.neighbours(cur) {
+			// a level walk goes back the same way; any other edge only if
+			// the place it reaches has the edge back (a drop of two, a gap's
+			// jump: one way)
+			if seen[e.to.Pos] || e.to.Kind != Walk && !g.edgeBack(e.to, cur) {
+				continue
+			}
+			seen[e.to.Pos] = true
+			queue = append(queue, e.to)
+		}
+	}
+	return best
+}
+
+// edgeBack reports whether there is a move from b back to a.
+func (g *Graph) edgeBack(b, a Node) bool {
+	for _, e := range g.neighbours(b) {
+		if e.to.Pos == a.Pos {
+			return true
+		}
+	}
+	return false
 }
 
 type item struct {

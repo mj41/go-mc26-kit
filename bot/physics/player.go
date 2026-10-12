@@ -8,7 +8,8 @@
 //
 // Not yet: flying, elytra, riding, swimming pose, cobwebs and berry bushes,
 // powder snow, bubble columns, honey, soul speed, effects (jump boost, slow
-// falling, levitation), entity collisions.
+// falling, levitation). Entities are collided with when the Blocks given is also
+// an EntitySolids (a boat, a shulker).
 package physics
 
 import (

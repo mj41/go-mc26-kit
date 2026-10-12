@@ -24,6 +24,10 @@ type World struct {
 	Columns map[level.ChunkPos]*level.Chunk
 	light   map[level.ChunkPos]*columnLight // the columns' light (light.go)
 	minY    int                             // the lowest block y of the dimension the player is in
+	// predicted are the blocks the client changed before the server said,
+	// with the server's state, till the server's ack (predict.go)
+	predicted map[BlockPos]prediction
+	acked     int32 // the highest sequence the server has acked (BlockChangedAck)
 }
 
 // RLock and RUnlock hold the world for reading; Lock and Unlock for writing.
@@ -56,6 +60,7 @@ func NewWorld(c *bot.Client, p *basic.Player, events EventsListener) (w *World) 
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayChunkBatchFinished, F: w.handleChunkBatchFinishedPacket},
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayBlockUpdate, F: w.handleBlockUpdate},
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlaySectionBlocksUpdate, F: w.handleSectionBlocksUpdate},
+		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayBlockChangedAck, F: w.handleBlockChangedAck},
 	)
 	return
 }

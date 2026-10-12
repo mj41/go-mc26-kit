@@ -1,6 +1,8 @@
 package path
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -37,7 +39,35 @@ type Walker struct {
 	sinceBet int     // ticks since it came closer
 	replans  int
 	ticks    int
-	release  bool // the keys of the last job are still held
+	release  bool         // the keys of the last job are still held
+	noPath   *NoPathError // the last walk's search that found no way (nil: none)
+
+	// the search (SEARCH.md): on a goroutine of its own, its result published under mu
+	gen       int                // the walk asked: Goto, Follow and Stop supersede the search running
+	cancel    context.CancelFunc // of the search running (nil: none)
+	searching bool
+	searchFor world.BlockPos // the goal the search running is for
+	result    *searched      // a finished search not yet taken by Think
+	retryAt   int            // a follow whose target is unreachable searches again at this tick
+	refresh   bool           // a follow's goal moved: a new search starts while the path in hand is still walked
+}
+
+// searched is a finished search: the walk (generation) and goal it was for, and what it found.
+type searched struct {
+	gen  int
+	goal world.BlockPos
+	path []Node
+	err  error
+}
+
+// supersede drops the search running and any result not taken: a new walk is asked. The caller holds w.mu.
+func (w *Walker) supersede() {
+	w.gen++
+	if w.cancel != nil {
+		w.cancel()
+		w.cancel = nil
+	}
+	w.searching, w.result, w.retryAt, w.refresh = false, nil, 0, false
 }
 
 type job struct {
@@ -54,14 +84,31 @@ type job struct {
 func (w *Walker) Goto(goal world.BlockPos) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if !(w.job.active && w.job.follow == nil && w.job.goal == goal) {
+		w.supersede() // (the same goal asked again keeps the search running: a caller that asks each round would never see one end)
+	}
 	w.job = job{active: true, goal: goal}
-	w.path, w.replans, w.status = nil, 0, "walking"
+	w.path, w.replans, w.status, w.noPath = nil, 0, "walking", nil
+}
+
+// NoPath is the last walk's search that found no way to its goal: the place
+// reached nearest the goal (Closest) and whether it searched every place
+// reachable (not Limit) — a goal no walk can reach, where a person goes as
+// far as the land lets.
+func (w *Walker) NoPath() (NoPathError, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.noPath == nil {
+		return NoPathError{}, false
+	}
+	return *w.noPath, true
 }
 
 // Follow keeps within near blocks of where target says, until Stop.
 func (w *Walker) Follow(target func() (x, y, z float64, ok bool), near float64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.supersede()
 	w.job = job{active: true, follow: target, near: near}
 	w.path, w.replans, w.status = nil, 0, "following"
 }
@@ -70,6 +117,7 @@ func (w *Walker) Follow(target func() (x, y, z float64, ok bool), near float64) 
 func (w *Walker) Stop() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.supersede()
 	w.job.active = false
 	w.status = "stopped"
 }
@@ -120,18 +168,54 @@ func (w *Walker) Think(s *control.State, bp *basic.Player) {
 		}
 		goal := world.BlockPos{X: int(math.Floor(tx)), Y: int(math.Floor(ty + 1e-6)), Z: int(math.Floor(tz))}
 		if goal != w.job.goal || w.ticks%20 == 0 {
-			w.job.goal, w.path = goal, nil
+			w.job.goal, w.refresh = goal, true // the path in hand is walked till the new one is found
 		}
 	}
 
-	if w.path == nil || !w.stillThere() {
-		if err := w.plan(pos); err != nil {
-			if w.job.follow != nil {
-				s.Input = control.Input{} // wait for the target to be reachable
-				w.path = nil
+	if s.Stepped && w.result == nil && (w.path == nil || !w.stillThere() || w.refresh) && !(w.job.follow != nil && w.ticks < w.retryAt) {
+		// a stepped game: the search is made here, its result taken below at once (SEARCH.md)
+		w.result = w.searchNow(pos)
+		w.refresh = false
+	}
+	took := false                // a search's path taken at this tick (an empty one: already there)
+	if r := w.result; r != nil { // a search ended: its result is taken here, on the tick (SEARCH.md)
+		w.result = nil
+		if r.gen == w.gen && r.goal == w.job.goal {
+			if r.err != nil {
+				var np *NoPathError
+				if errors.As(r.err, &np) {
+					w.noPath = np
+				}
+				if w.job.follow != nil {
+					s.Input = control.Input{} // wait for the target to be reachable: not searched again for a second
+					w.path, w.retryAt = nil, w.ticks+20
+					return
+				}
+				w.end(s, "failed: "+r.err.Error())
 				return
 			}
-			w.end(s, "failed: "+err.Error())
+			path := r.path
+			if len(path) == 0 && w.Precise && w.job.follow == nil {
+				start, _ := w.Graph.Start(pos.X, pos.Y, pos.Z)
+				path = []Node{start} // there already: to its middle
+			}
+			w.path, w.i = path, 0
+			w.best, w.sinceBet = math.MaxFloat64, 0
+			took = true
+		}
+	}
+	need := !took && (w.path == nil || !w.stillThere())
+	if need {
+		w.path = nil
+	}
+	if !took && (need || w.refresh) {
+		running := w.searching && w.searchFor == w.job.goal
+		if !running && !(w.job.follow != nil && w.ticks < w.retryAt) {
+			w.startSearch(pos)
+			w.refresh = false
+		}
+		if need {
+			s.Input = control.Input{Shift: w.Sneak} // the search runs: standing, the tick goes on
 			return
 		}
 	}
@@ -218,23 +302,44 @@ func (w *Walker) inWater(bp *basic.Player) bool {
 	return w.Graph.water(world.BlockPos{X: int(math.Floor(p.X)), Y: int(math.Floor(p.Y)), Z: int(math.Floor(p.Z))})
 }
 
-// plan searches from where the player is.
-func (w *Walker) plan(pos basic.Position) error {
+// searchNow is the search for the current goal from where the player is, made in the caller. The caller holds w.mu.
+func (w *Walker) searchNow(pos basic.Position) *searched {
 	max := w.MaxNodes
 	if max == 0 {
 		max = 100000 // a way out of a tunnel and round a hill
 	}
 	start, _ := w.Graph.Start(pos.X, pos.Y, pos.Z)
 	path, err := w.Graph.Find(start, w.job.goal, max)
-	if err != nil {
-		return err
+	return &searched{gen: w.gen, goal: w.job.goal, path: path, err: err}
+}
+
+// startSearch starts the search for the current goal from where the player is, on a goroutine of its own: the
+// copy of what it needs is taken here, under mu, and its result is left in w.result for the next Think. A search
+// still running for another goal is cancelled. The caller holds w.mu.
+func (w *Walker) startSearch(pos basic.Position) {
+	if w.cancel != nil {
+		w.cancel()
 	}
-	if len(path) == 0 && w.Precise && w.job.follow == nil {
-		path = []Node{start} // there already: to its middle
+	max := w.MaxNodes
+	if max == 0 {
+		max = 100000 // a way out of a tunnel and round a hill
 	}
-	w.path, w.i = path, 0
-	w.best, w.sinceBet = math.MaxFloat64, 0
-	return nil
+	start, _ := w.Graph.Start(pos.X, pos.Y, pos.Z)
+	goal, gen := w.job.goal, w.gen
+	ctx, cancel := context.WithCancel(context.Background())
+	w.cancel, w.searching, w.searchFor = cancel, true, goal
+	g := w.Graph
+	go func() {
+		path, err := g.FindContext(ctx, start, goal, max)
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if ctx.Err() != nil || gen != w.gen {
+			return // superseded: a newer walk or search owns the state
+		}
+		w.searching, w.cancel = false, nil
+		w.result = &searched{gen: gen, goal: goal, path: path, err: err}
+		cancel()
+	}()
 }
 
 // stillThere checks the next few nodes are still places to be: a block put

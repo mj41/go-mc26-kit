@@ -19,10 +19,15 @@ const DayLength = 24000
 
 // Clock is the time the server last said, and when it said it.
 type Clock struct {
+	// Now is the time the clock runs on between the server's updates (nil: the
+	// wall's). A game run on a stepped clock (bot/control.Stepped) gives its own.
+	Now func() time.Time
+
 	c        *bot.Client
 	mu       sync.Mutex
-	gameTime int64
-	day      state // the overworld's clock
+	gameTime int64     // the world's age the server last said
+	gameAt   time.Time // when it said it
+	day      state     // the overworld's clock
 	hasDay   bool
 }
 
@@ -39,6 +44,14 @@ func New(c *bot.Client) *Clock {
 	return k
 }
 
+// now is the time the clock runs on.
+func (k *Clock) now() time.Time {
+	if k.Now != nil {
+		return k.Now()
+	}
+	return time.Now()
+}
+
 func (k *Clock) onSetTime(p pk.Packet) error {
 	var st play.SetTime
 	if err := p.Scan(&st); err != nil {
@@ -46,13 +59,13 @@ func (k *Clock) onSetTime(p pk.Packet) error {
 	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	k.gameTime = int64(st.GameTime)
+	k.gameTime, k.gameAt = int64(st.GameTime), k.now()
 	for _, e := range st.ClockUpdates {
 		name, ok := k.c.Registries.WorldClock.KeyOf(int32(e.Key))
 		if !ok || name != "minecraft:overworld" {
 			continue
 		}
-		k.day = state{ticks: float64(e.Val.TotalTicks) + float64(e.Val.PartialTick), rate: float64(e.Val.Rate), at: time.Now()}
+		k.day = state{ticks: float64(e.Val.TotalTicks) + float64(e.Val.PartialTick), rate: float64(e.Val.Rate), at: k.now()}
 		k.hasDay = true
 	}
 	return nil
@@ -67,7 +80,22 @@ func (k *Clock) DayTicks() (int64, bool) {
 	if !k.hasDay {
 		return 0, false
 	}
-	return int64(k.day.ticks + k.day.rate*time.Since(k.day.at).Seconds()*20), true
+	return int64(k.day.ticks + k.day.rate*k.now().Sub(k.day.at).Seconds()*20), true
+}
+
+// GameTime is the world's age in ticks now — what the server last said, run
+// on by the wall's time since but never past the next tick the server would
+// say it at (it says it every 20 ticks: a lagging server's ticks are not
+// counted before it has made them) — and whether the server has said. Not
+// the day: a /time set moves the day, not the game time, so lengths measured
+// by it are the game's.
+func (k *Clock) GameTime() (int64, bool) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.gameAt.IsZero() {
+		return 0, false
+	}
+	return k.gameTime + min(int64(k.now().Sub(k.gameAt).Seconds()*20), 19), true
 }
 
 // TimeOfDay is the day's tick, 0 to 23999 (0 the sun up past dawn, 6000

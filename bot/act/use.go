@@ -69,6 +69,7 @@ type use struct {
 	sent    bool
 	before  block.StateID
 	waited  int
+	seq     int32 // the click's sequence: its ack says the server has answered
 }
 
 func (u *use) finish(r Use) bool {
@@ -132,21 +133,29 @@ func (u *use) step(h *Hands, s *control.State, bp *basic.Player) bool {
 		return false
 	}
 	if !u.sent {
-		if err := h.useItemOn(u.clicked, u.face, u.cursor); err != nil {
+		seq, err := h.useItemOn(u.clicked, u.face, u.cursor)
+		if err != nil {
 			return u.finish(Use{Err: err})
 		}
+		u.seq = seq
 		u.sent = true
 		if u.noWait {
 			return u.finish(Use{State: cur})
 		}
 		return false
 	}
-	// the server answers with the block's new state
+	// the server answers with the block's new state, then the click's ack:
+	// acked and the block the same, the place was refused. Waited for by the
+	// ack, not a count of the client's ticks: a busy server answered after
+	// 20 of them, and a place it made was taken for refused (botprobe's hut)
 	if cur != u.before {
 		return u.finish(Use{State: cur, Ticks: u.waited})
 	}
-	if u.waited++; u.waited > 20 {
+	if h.World.Acked() >= u.seq {
 		return u.finish(Use{State: cur, Err: errors.New("act: the server did not change the block")})
+	}
+	if u.waited++; u.waited > 200 {
+		return u.finish(Use{State: cur, Err: errors.New("act: the server never answered the place")})
 	}
 	return false
 }
@@ -203,20 +212,22 @@ func reach(bp *basic.Player) float64 {
 // (the block, its face, where on it, not inside, not the world border), the
 // next prediction sequence. Written field by field: its hit field is named
 // differently across versions. Before 26.3 the client then swings its arm.
-func (h *Hands) useItemOn(pos world.BlockPos, face Face, cursor [3]float32) error {
+func (h *Hands) useItemOn(pos world.BlockPos, face Face, cursor [3]float32) (int32, error) {
+	seq := h.nextSequence()
 	err := h.C.Conn.WritePacket(pk.Marshal(packetid.ServerboundPlayUseItemOn,
 		pk.VarInt(0),
 		pk.Position{X: pos.X, Y: pos.Y, Z: pos.Z}, pk.VarInt(face),
 		pk.Float(cursor[0]), pk.Float(cursor[1]), pk.Float(cursor[2]),
 		pk.Boolean(false), pk.Boolean(false),
-		h.nextSequence()))
+		seq))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if version.ProtocolVersion < 777 {
-		return h.swing()
+		return int32(seq), h.swing()
 	}
-	return nil
+	h.swungByServer()
+	return int32(seq), nil
 }
 
 // Eat uses the held food or drink, as a person holding the use key does
@@ -288,6 +299,8 @@ func (u *useToward) tick(h *Hands, s *control.State, bp *basic.Player) bool {
 		pk.VarInt(0), h.nextSequence(), pk.Float(p.Yaw), pk.Float(p.Pitch)))
 	if err == nil && version.ProtocolVersion < 777 {
 		err = h.swing()
+	} else if err == nil {
+		h.swungByServer()
 	}
 	u.done(Use{Err: err})
 	return true

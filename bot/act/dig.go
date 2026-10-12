@@ -106,11 +106,17 @@ func (d *dig) tick(h *Hands, s *control.State, bp *basic.Player) bool {
 	step := h.DestroyProgress(state, s, bp)
 	if !d.started {
 		d.started, d.was = true, state
-		if err := h.send(play.PlayerAction{Action: types.PlayerActionActionStartDestroyBlock, Pos: d.pk(), Direction: pk.UnsignedByte(d.face), Sequence: h.nextSequence()}); err != nil {
+		seq := h.nextSequence()
+		// The prediction before the packet, as the client makes it (MultiPlayerGameMode.startPrediction): the
+		// server's ack can be read before the line after the send runs, and an ack that comes before its
+		// prediction leaves the guess in the world for good.
+		if step >= 1 {
+			h.World.Predict(d.pos, emptyOf(state), int32(seq)) // broken at once, as the client predicts: the server's ack says
+		}
+		if err := h.send(play.PlayerAction{Action: types.PlayerActionActionStartDestroyBlock, Pos: d.pk(), Direction: pk.UnsignedByte(d.face), Sequence: seq}); err != nil {
 			return d.finish(Dig{Err: err})
 		}
 		if step >= 1 {
-			h.World.SetBlock(d.pos, emptyOf(state)) // broken at once, as the client predicts
 			return d.finish(Dig{Ticks: 0, Was: state})
 		}
 		return false
@@ -124,10 +130,11 @@ func (d *dig) tick(h *Hands, s *control.State, bp *basic.Player) bool {
 		return d.finish(Dig{Err: err})
 	}
 	if d.progress >= 1 {
-		if err := h.send(play.PlayerAction{Action: types.PlayerActionActionStopDestroyBlock, Pos: d.pk(), Direction: pk.UnsignedByte(d.face), Sequence: h.nextSequence()}); err != nil {
+		seq := h.nextSequence()
+		h.World.Predict(d.pos, emptyOf(state), int32(seq)) // before the packet, as above; the server's ack says
+		if err := h.send(play.PlayerAction{Action: types.PlayerActionActionStopDestroyBlock, Pos: d.pk(), Direction: pk.UnsignedByte(d.face), Sequence: seq}); err != nil {
 			return d.finish(Dig{Err: err})
 		}
-		h.World.SetBlock(d.pos, emptyOf(state))
 		return d.finish(Dig{Ticks: d.ticks, Was: d.was, Airborne: d.airborne})
 	}
 	return false

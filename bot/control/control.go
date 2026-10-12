@@ -85,6 +85,10 @@ type State struct {
 	// false from a spawn until ServerboundPlayerLoaded is sent; the client
 	// neither moves nor sends its position before.
 	Loaded bool
+	// Stepped is whether the controller runs on a stepped clock (a game a test steps from its loop): what
+	// Think does in the background on a real clock (the walker's search) it does inline, so that nothing
+	// changes in the world while it runs and the game is the same each time it is stepped.
+	Stepped bool
 	// Ticks counts the ticks since the controller started.
 	Ticks uint64
 	// Teleports counts the teleports the server sent and the client
@@ -115,6 +119,16 @@ type Controller struct {
 	p *basic.Player
 	w *world.World
 
+	// Tick is the length of its tick (0: the game's, TickInterval). A
+	// test on a fake server runs its ticks faster — the same ticks, the
+	// moves and digs the same; a real server would see a client too fast.
+	Tick time.Duration
+
+	// Clock is where its ticks and waits come from (nil: the wall's). A
+	// stepped clock (NewStepped) ticks only when stepped: a game run to the
+	// tick, as fast as the machine goes.
+	Clock Clock
+
 	// Act does what the hands do this tick — dig, place, use — before Think,
 	// with the controller locked (Minecraft.tick: the key bindings, then the
 	// entities).
@@ -133,6 +147,10 @@ type Controller struct {
 	// rotation every tick instead of its position (LocalPlayer.sendChanges);
 	// the vehicle moves itself, or the server moves it.
 	Ride func(s *State, p *basic.Player) bool
+	// Ticked, when set, is called at the end of each tick the player is in
+	// the level, with the controller locked: for a watcher to read what this
+	// tick made (where the player is now, what the server told of others).
+	Ticked func(s *State, p *basic.Player)
 	// Loaded, when set, is called (from the tick goroutine, unlocked) once the
 	// client has told the server it loaded the level.
 	Loaded func()
@@ -146,6 +164,7 @@ type Controller struct {
 
 	sent             sent
 	positionReminder int
+	tickedC          chan struct{} // closed when a tick has ended: WaitTicks's wake (under mu)
 }
 
 // sent is what LocalPlayer.sendChanges remembers of what it sent last.
@@ -194,30 +213,71 @@ func (ctl *Controller) Look(yaw, pitch float32) {
 	})
 }
 
-// WaitTicks returns after n more ticks, or when ctx is done.
+// clock is where its ticks come from: Clock, else the wall's.
+func (ctl *Controller) clock() Clock {
+	if ctl.Clock != nil {
+		return ctl.Clock
+	}
+	return Wall
+}
+
+// tickLen is its tick's length: Tick, else the game's (TickInterval).
+func (ctl *Controller) tickLen() time.Duration {
+	if ctl.Tick > 0 {
+		return ctl.Tick
+	}
+	return TickInterval
+}
+
+// WaitTicks returns after n more ticks, or when ctx is done. It is woken by
+// each tick's end (not by polling), so on a stepped clock no timer is set and
+// what it wakes runs before the next tick.
 func (ctl *Controller) WaitTicks(ctx context.Context, n int) error {
-	until := ctl.State().Ticks + uint64(n)
-	for ctl.State().Ticks < until {
+	ctl.mu.Lock()
+	until := ctl.state.Ticks + uint64(n)
+	ctl.mu.Unlock()
+	for {
+		ctl.mu.Lock()
+		if ctl.state.Ticks >= until {
+			ctl.mu.Unlock()
+			return nil
+		}
+		if ctl.tickedC == nil {
+			ctl.tickedC = make(chan struct{})
+		}
+		ch := ctl.tickedC
+		ctl.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(TickInterval / 5):
+		case <-ch:
 		}
 	}
-	return nil
+}
+
+// ticked wakes the ones waiting for a tick: the tick that ended is counted.
+func (ctl *Controller) ticked() {
+	ctl.mu.Lock()
+	if ctl.tickedC != nil {
+		close(ctl.tickedC)
+		ctl.tickedC = nil
+	}
+	ctl.mu.Unlock()
 }
 
 // Run ticks until ctx is done or the connection cannot take another packet.
 func (ctl *Controller) Run(ctx context.Context) error {
-	t := time.NewTicker(TickInterval)
+	t := ctl.clock().NewTicker(ctl.tickLen())
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-t.C:
+		case <-t.C():
 		}
 		loaded, err := ctl.tick()
+		ctl.ticked()
+		t.Done()
 		if err != nil {
 			return err
 		}
@@ -255,6 +315,7 @@ func (ctl *Controller) tick() (loaded bool, err error) {
 			ctl.Act(&ctl.state, ctl.p)
 		}
 		if ctl.Think != nil && !ctl.state.Riding {
+			_, ctl.state.Stepped = ctl.Clock.(*Stepped)
 			ctl.Think(&ctl.state, ctl.p)
 		}
 		if ctl.Step != nil && !ctl.state.Riding {
@@ -264,13 +325,16 @@ func (ctl *Controller) tick() (loaded bool, err error) {
 			return loaded, err
 		}
 	}
+	if ctl.Ticked != nil {
+		ctl.Ticked(&ctl.state, ctl.p)
+	}
 	return loaded, ctl.send(play.ClientTickEnd{})
 }
 
 // levelReady is LevelLoadTracker.WaitingForPlayerChunk.isReady: the chunk the
 // player is in has arrived, or the wait timed out.
 func (ctl *Controller) levelReady() bool {
-	if time.Now().After(ctl.loadUntil) {
+	if ctl.clock().Now().After(ctl.loadUntil) {
 		return true
 	}
 	pos := ctl.p.Position()
@@ -354,7 +418,7 @@ func (ctl *Controller) onSpawn(pk.Packet) error {
 	defer ctl.mu.Unlock()
 	ctl.inLevel = true
 	ctl.loadStarted = false
-	ctl.loadUntil = time.Now().Add(clientLoadTimeout)
+	ctl.loadUntil = ctl.clock().Now().Add(clientLoadTimeout)
 	ctl.state.Loaded = false
 	ctl.state.OnGround, ctl.state.HorizontalCollision, ctl.state.Sprinting = false, false, false
 	ctl.sent = sent{input: ctl.sent.input} // a new LocalPlayer keeps the last sent input
