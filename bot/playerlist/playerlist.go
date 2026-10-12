@@ -1,9 +1,7 @@
-// Package playerlist contains a PlayerList struct that used to manage player information.
-//
-// The [PlayerList] contains a list of [PlayerInfo] which is received from server when client join.
-// The playerlist contains every players' information of name, display name, uuid, gamemode, latency, public key, etc.
-// And can be used to render the "TAB List". Other packages may also require playerlist to work,
-// for example, the bot/msg package.
+// Package playerlist keeps the player list the server sends (the tab list): a
+// [PlayerInfo] per player with its name, display name, uuid, game mode,
+// latency and chat-signing key. Package msg needs it to tell who sent a
+// message.
 package playerlist
 
 import (
@@ -21,6 +19,7 @@ import (
 	"github.com/mj41/go-mc26/yggdrasil/user"
 )
 
+// PlayerList is the players the server lists, by uuid; create it with New.
 type PlayerList struct {
 	// mu is held while a packet changes PlayerInfos; ByName reads under it.
 	mu          sync.RWMutex
@@ -39,6 +38,8 @@ func (pl *PlayerList) ByName(name string) (uuid.UUID, bool) {
 	return uuid.UUID{}, false
 }
 
+// New returns an empty player list and registers on c the handlers that keep
+// it up to date.
 func New(c *bot.Client) *PlayerList {
 	pl := PlayerList{
 		PlayerInfos: make(map[uuid.UUID]*PlayerInfo),

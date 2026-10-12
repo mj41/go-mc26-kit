@@ -7,13 +7,6 @@ import (
 	"github.com/mj41/go-mc26/net/queue"
 )
 
-// Packet758 is a packet in protocol 757.
-// We are using type system to force programmers to update packets.
-type (
-	Packet758 pk.Packet
-	Packet757 pk.Packet
-)
-
 type WritePacketError struct {
 	Err error
 	ID  int32

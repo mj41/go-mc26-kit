@@ -90,10 +90,9 @@ func (c *Client) ReadUpdateTags(data []byte) error {
 		if err := c.Tags.readRegistry(string(registryID), io.TeeReader(r, &part)); err != nil {
 			return err
 		}
-		if registry := c.Registries.Registry(string(registryID)); registry != nil {
-			if _, err := registry.ReadTagsFrom(&part); err != nil {
-				return err
-			}
+		// never nil: a registry not known is kept raw (Registries.Registry)
+		if _, err := c.Registries.Registry(string(registryID)).ReadTagsFrom(&part); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -1,10 +1,12 @@
-// Package basic provides some basic packet handler which client needs.
+// Package basic is the part of the client every bot needs: the Player, which
+// answers the server's keep-alives (without it the server drops the client),
+// keeps what the server says about the player and reports it as events.
 //
 // # [Player]
 //
-// The [Player] is attached to a [Client] by calling [NewPlayer] before the client joins a server.
+// The [Player] is attached to a [bot.Client] by calling [NewPlayer] before the client joins a server.
 //
-// There is 4 kinds of clientbound packet is handled by this package.
+// This package handles these clientbound packets:
 //   - LoginPacket, kept as [Player.Login]; its spawn info as [Player.Spawn].
 //   - KeepAlivePacket, for avoid the client to be kicked by the server.
 //   - PlayerPosition, is only received when server teleporting the player.
@@ -12,15 +14,17 @@
 //
 // # [EventsListener]
 //
-// Handles some basic event you probably need.
+// The events a bot usually needs:
 //   - GameStart
 //   - Disconnect
 //   - HealthChange
 //   - Death
+//   - Teleported
 package basic
 
 import (
 	"sync"
+	"time"
 
 	"github.com/mj41/go-mc26-kit/bot"
 	"github.com/mj41/go-mc26/data/packetid"
@@ -30,9 +34,16 @@ import (
 	"github.com/mj41/go-mc26/protocol/types"
 )
 
+// Player is the player of a bot.Client, made by NewPlayer: its settings, what
+// the server told it at login and since (Login, Spawn, Position, Attribute),
+// and the methods that act as the player (Respawn, AcceptTeleportation).
 type Player struct {
 	c        *bot.Client
 	Settings Settings
+
+	// KeepAliveTimeout is how long, on the wall clock, the connection waits for the server's next keep-alive: 0 the
+	// package's KeepAliveTimeout, negative never (a game on a stepped clock). Set it before the game starts.
+	KeepAliveTimeout time.Duration
 
 	// Login is the last play.Login the server sent: the entity id, the level
 	// names, the view and simulation distances, the game rules the client is
@@ -52,6 +63,8 @@ type Player struct {
 // NewPlayer create a new Player manager.
 func NewPlayer(c *bot.Client, settings Settings, events EventsListener) *Player {
 	p := &Player{c: c, Settings: settings}
+	// the keep-alive's answer is the reader's, not HandleGame's: it must not wait for user code (keepalive.go)
+	c.Events.AddReadHook(bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayKeepAlive, F: p.answerKeepAlive})
 	c.Events.AddListener(
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayLogin, F: p.handleLoginPacket},
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayKeepAlive, F: p.handleKeepAlivePacket},

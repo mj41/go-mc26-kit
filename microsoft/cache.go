@@ -78,11 +78,21 @@ func (c *tokenCache) save(state cachedLiveState) error {
 	if err != nil {
 		return err
 	}
-	tmpPath := c.path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+	// a new file for every save, created 0600 (os.CreateTemp): os.WriteFile on a fixed name keeps the mode of
+	// a file left there before (a crash's 0644 .tmp), and the refresh token would be readable by others
+	tmp, err := os.CreateTemp(filepath.Dir(c.path), filepath.Base(c.path)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, c.path)
+	_, err = tmp.Write(data)
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return os.Rename(tmp.Name(), c.path)
 }
 
 func (c *tokenCache) clear() error {

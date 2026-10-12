@@ -18,6 +18,9 @@ type packetReadWriter interface {
 	WritePacket(pk.Packet) error
 }
 
+// ConfigHandler answers the configuration phase's choices: the features the
+// server enables, the resource packs it pushes and the known data packs.
+// NewClient sets DefaultConfigHandler.
 type ConfigHandler interface {
 	EnableFeature(features []pk.Identifier)
 
@@ -39,6 +42,8 @@ type ResourcePack struct {
 // DataPack is a known pack offered by the server (namespace, id, version).
 type DataPack = types.KnownPack
 
+// ConfigErr is a failure of JoinServer in the configuration phase: Stage says
+// where.
 type ConfigErr struct {
 	Stage string
 	Err   error
@@ -117,6 +122,7 @@ func (c *Client) joinConfiguration(conn packetReadWriter) error {
 			if err := p.Scan(&ka); err != nil {
 				return ConfigErr{ErrStage, err}
 			}
+			//lint:ignore S1016 a struct literal, not a conversion: the kit is assembled for each version, and a version whose two packets differ would not build
 			if err := sendConfig(conn, configuration.ServerboundKeepAlive{ID: ka.ID}); err != nil {
 				return ConfigErr{ErrStage, err}
 			}
@@ -126,6 +132,7 @@ func (c *Client) joinConfiguration(conn packetReadWriter) error {
 			if err := p.Scan(&ping); err != nil {
 				return ConfigErr{"ping", err}
 			}
+			//lint:ignore S1016 a struct literal, not a conversion: the kit is assembled for each version, and a version whose two packets differ would not build
 			if err := sendConfig(conn, configuration.Pong{ID: ping.ID}); err != nil {
 				return ConfigErr{"pong", err}
 			}
@@ -243,10 +250,14 @@ func (c *Client) joinConfiguration(conn packetReadWriter) error {
 	}
 }
 
+// DefaultConfigHandler keeps the resource packs the server pushes and answers
+// that it knows none of the data packs the server offers, so the server sends
+// the registries in full.
 type DefaultConfigHandler struct {
 	resourcesPack []ResourcePack
 }
 
+// NewDefaultConfigHandler returns an empty DefaultConfigHandler.
 func NewDefaultConfigHandler() *DefaultConfigHandler {
 	return &DefaultConfigHandler{
 		resourcesPack: make([]ResourcePack, 0),

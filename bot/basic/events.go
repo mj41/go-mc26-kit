@@ -53,7 +53,7 @@ type EventsListener struct {
 	// The position coordinates and rotation are absolute or relative depends on the flags.
 	// The flags field is a u32 bitfield (PositionUpdateRelatives) with bits:
 	//   0x01=X, 0x02=Y, 0x04=Z, 0x08=Yaw, 0x10=Pitch, 0x20=DX, 0x40=DY, 0x80=DZ, 0x100=YawDelta
-	// For more information, see https://wiki.vg/Protocol#Synchronize_Player_Position
+	// For more information, see https://minecraft.wiki/w/Java_Edition_protocol/Packets (Synchronize Player Position)
 	Teleported func(x, y, z float64, yaw, pitch float32, flags int32, teleportID int32) error
 }
 

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/google/uuid"
@@ -25,7 +26,7 @@ import (
 	"github.com/mj41/go-mc26/yggdrasil/user"
 )
 
-// Deprecated: Moved to go-mc/yggdrasil/user, because go-mc/bot also needs them
+// Deprecated: use the same types of github.com/mj41/go-mc26/yggdrasil/user.
 type (
 	Texture   = user.Texture
 	Property  = user.Property
@@ -34,8 +35,24 @@ type (
 
 const verifyTokenLen = 16
 
-// Encrypt a connection, with authentication
+// Session is the session server a login is verified with: Mojang's unless URL says otherwise.
+type Session struct {
+	URL    string       // its base URL; empty: https://sessionserver.mojang.com
+	Client *http.Client // nil: http.DefaultClient
+}
+
+// ErrUnverified is a session server's answer that the player did not join this server: a client that did
+// not authenticate, or authenticated with another digest. A vanilla server disconnects it with
+// multiplayer.disconnect.unverified_username ("Failed to verify username!").
+var ErrUnverified = errors.New("auth: the session server has no record of the player joining")
+
+// Encrypt a connection, with authentication at Mojang's session server.
 func Encrypt(conn *net.Conn, name string, serverKey *rsa.PrivateKey) (*Resp, error) {
+	return EncryptSession(conn, name, serverKey, Session{})
+}
+
+// EncryptSession is Encrypt with the player verified at session.
+func EncryptSession(conn *net.Conn, name string, serverKey *rsa.PrivateKey, session Session) (*Resp, error) {
 	publicKey, err := x509.MarshalPKIXPublicKey(&serverKey.PublicKey)
 	if err != nil {
 		return nil, err
@@ -70,12 +87,7 @@ func Encrypt(conn *net.Conn, name string, serverKey *rsa.PrivateKey) (*Resp, err
 		CFB8.NewCFB8Decrypt(block, SharedSecret),
 	)
 	hash := authDigest("", SharedSecret, publicKey)
-	resp, err := authentication(name, hash) // auth
-	if err != nil {
-		return nil, errors.New("auth servers down")
-	}
-
-	return resp, nil
+	return authentication(session, name, hash)
 }
 
 // encryptionRequest sends the login-state clientbound hello: an empty server
@@ -122,27 +134,43 @@ func encryptionResponse(conn *net.Conn, serverKey *rsa.PrivateKey, verifyToken [
 	return sharedSecret, nil
 }
 
-func authentication(name, hash string) (*Resp, error) {
-	resp, err := http.Get("https://sessionserver.mojang.com/session/minecraft/hasJoined?username=" + name + "&serverId=" + hash)
+// authentication asks the session server whether the player joined with the digest hash: its profile, or
+// ErrUnverified (it answers 204, no content, for a join it does not know).
+func authentication(session Session, name, hash string) (*Resp, error) {
+	base, client := session.URL, session.Client
+	if base == "" {
+		base = "https://sessionserver.mojang.com"
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Get(base + "/session/minecraft/hasJoined?username=" + url.QueryEscape(name) + "&serverId=" + url.QueryEscape(hash))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("auth: session server: %w", err)
 	}
 	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNoContent:
+		return nil, ErrUnverified
+	default:
+		return nil, fmt.Errorf("auth: session server: %s", resp.Status)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-
 	var Resp Resp
-	err = json.Unmarshal(body, &Resp)
-
-	return &Resp, err
+	if err := json.Unmarshal(body, &Resp); err != nil {
+		return nil, fmt.Errorf("auth: session server's profile: %w", err)
+	}
+	return &Resp, nil
 }
 
 // authDigest computes a special SHA-1 digest required for Minecraft web
 // authentication on Premium servers (online-mode=true).
-// Source: http://wiki.vg/Protocol_Encryption#Server
+// Source: https://minecraft.wiki/w/Java_Edition_protocol/Encryption
 //
 // Also many, many thanks to SirCmpwn and his wonderful gist (C#):
 // https://gist.github.com/SirCmpwn/404223052379e82f91e6

@@ -1,7 +1,33 @@
-// Package bot implements a simple Minecraft client that can join a server
-// or just ping it for getting information.
+// Package bot is a Minecraft: Java Edition client: it joins a server (login,
+// configuration) and hands every play packet to the handlers registered on
+// Client.Events. It also pings a server for its list entry (PingAndList).
 //
-// Runnable example could be found at examples/ .
+// A bot is built in this order:
+//
+//	c := bot.NewClient()
+//	c.Auth.Name = "Steve"                      // offline mode: a name is all it needs
+//	p := basic.NewPlayer(c, basic.DefaultSettings, basic.EventsListener{ /* GameStart, Disconnect, … */ })
+//	chat := msg.New(c, p, playerlist.New(c), msg.EventsHandler{ /* PlayerChat, SystemChat */ })
+//	err := c.JoinServer("localhost:25565")
+//	err = c.HandleGame()                       // blocks until the connection ends
+//
+// basic.NewPlayer is required: it answers the server's keep-alives and reports
+// the game's start, a kick (return an error such as DisconnectErr from its
+// Disconnect handler to end HandleGame), health, death and teleports. Without a
+// control.Controller, confirm teleports in its Teleported handler
+// (Player.AcceptTeleportation). Client.Close ends the connection from another
+// goroutine (on Ctrl-C, say).
+//
+// For an online-mode server, log in with package microsoft and copy the result
+// into Auth (Name, UUID, AsTk). To handle any other packet, add a PacketHandler
+// with Client.Events.AddListener.
+//
+// The rest of the client builds on Client and basic.Player: world (the chunks),
+// screen (the inventory and open menus), entities, control (the client's 50 ms
+// tick: movement, the player-loaded notice, teleport answers), physics, path
+// (walking somewhere), act (digging, placing, crafting). Complete programs are in
+// the module's examples directory: minimal (the first program: chat and a clean
+// exit), daze (a console), robot (all of it).
 package bot
 
 import (
@@ -9,6 +35,7 @@ import (
 	"errors"
 	"github.com/mj41/go-mc26/protocol/types"
 	"net"
+	"net/http"
 	"strconv"
 
 	"github.com/mj41/go-mc26/chat"
@@ -20,23 +47,36 @@ import (
 	"github.com/mj41/go-mc26/yggdrasil/user"
 )
 
-// ProtocolVersion is the protocol version number of minecraft net protocol
 const (
+	// ProtocolVersion is the protocol this client speaks: the go-mc26 library's
+	// (version.ProtocolVersion), so the Minecraft version of the library this
+	// module is built with.
 	ProtocolVersion = version.ProtocolVersion
-	DefaultPort     = mcnet.DefaultPort
+	// DefaultPort is the port an address without one joins (25565).
+	DefaultPort = mcnet.DefaultPort
 )
 
+// JoinOptions are JoinServerWithOptions' options; the zero value is what
+// JoinServer uses.
 type JoinOptions struct {
+	// MCDialer dials the server; nil is the library's dialer (with SRV lookup).
 	MCDialer mcnet.MCDialer
-	Context  context.Context
+	// Context bounds the dial; it does not end the connection later (Client.Close does).
+	Context context.Context
 
-	// Indicate not to fetch and sending player's PubKey
+	// NoPublicKey and KeyPair are not used: this client sends no chat-signing
+	// key, so its chat is unsigned (a server enforcing secure chat refuses it).
 	NoPublicKey bool
+	KeyPair     *user.KeyPairResp
 
-	// Specify the player PubKey to use.
-	// If nil, it will be obtained from Mojang when joining
-	KeyPair *user.KeyPairResp
+	// SessionServer is the session server an online-mode login is announced to (its base URL): empty for
+	// Mojang's, https://sessionserver.mojang.com. HTTPClient makes that request (nil: http.DefaultClient). A
+	// test gives a fake one; a real client leaves both.
+	SessionServer string
+	HTTPClient    *http.Client
 
+	// QueueRead and QueueWrite buffer the packets between the connection and
+	// HandleGame (and the writers); nil is an unbounded queue.
 	QueueRead  queue.Queue[pk.Packet]
 	QueueWrite queue.Queue[pk.Packet]
 }
@@ -96,6 +136,12 @@ func (c *Client) join(addr string, options JoinOptions) error {
 	if err != nil {
 		return LoginErr{"connect server", err}
 	}
+	joined := false
+	defer func() {
+		if !joined { // a join that failed (refused, kicked, a broken handshake) leaves no connection open
+			_ = conn.Close()
+		}
+	}()
 
 	// Handshake
 	hs := handshake.ClientIntention{
@@ -109,7 +155,7 @@ func (c *Client) join(addr string, options JoinOptions) error {
 	}
 
 	// Login Start
-	if err := c.joinLogin(conn); err != nil {
+	if err := c.joinLogin(conn, options); err != nil {
 		return err
 	}
 
@@ -117,10 +163,16 @@ func (c *Client) join(addr string, options JoinOptions) error {
 	if err := c.joinConfiguration(conn); err != nil {
 		return err
 	}
-	c.Conn = warpConn(conn, options.QueueRead, options.QueueWrite)
+	c.Conn = warpConn(conn, options.QueueRead, options.QueueWrite, c.Events.read)
+	joined = true
 	return nil
 }
 
+// DisconnectErr is the reason a server gave for ending the connection. Join
+// returns it during login or configuration (wrapped in LoginErr or ConfigErr);
+// in play, basic.Player's Disconnect handler gets the reason, and returning
+// DisconnectErr(reason) from it makes HandleGame return it (wrapped in
+// PacketHandlerError). errors.As finds it in all three.
 type DisconnectErr chat.Message
 
 func (d DisconnectErr) Error() string {

@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -57,6 +58,10 @@ type MojangLoginHandler struct {
 	// (e.g., blacklist or is server full).
 	// This is an optional field and can be set to nil.
 	LoginChecker
+
+	// Session is the session server an online-mode login is verified with: Mojang's unless set (a test sets
+	// a fake one).
+	Session auth.Session
 
 	// PrivateKey is the key used by encrypt the connection.
 	privateKey     atomic.Pointer[rsa.PrivateKey]
@@ -118,7 +123,10 @@ func (d *MojangLoginHandler) AcceptLogin(conn *net.Conn, protocol int32) (name s
 		}
 		var resp *auth.Resp
 		// Auth, Encrypt
-		resp, err = auth.Encrypt(conn, name, serverKey)
+		resp, err = auth.EncryptSession(conn, name, serverKey, d.Session)
+		if errors.Is(err, auth.ErrUnverified) { // told to the client as a vanilla server tells it
+			err = LoginFailErr{reason: chat.TranslateMsg("multiplayer.disconnect.unverified_username")}
+		}
 		if err != nil {
 			return
 		}

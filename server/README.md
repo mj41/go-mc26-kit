@@ -1,4 +1,6 @@
 # Server
 
-This package provide a very basic framework for server development.  
-For more example, go to [this repo](https://github.com/go-mc/server).
+A framework for a Minecraft server: list ping, login (offline and online mode),
+configuration, a command graph and the player list. It has no gameplay; a
+server built on it provides its own. The package documentation (`go doc
+./server`) shows how the parts fit.

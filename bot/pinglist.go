@@ -19,7 +19,7 @@ import (
 // PingAndList check server status and list online player.
 // Returns a JSON data with server status, and the delay.
 //
-// For more information for JSON format, see https://wiki.vg/Server_List_Ping#Response
+// For more information for JSON format, see https://minecraft.wiki/w/Java_Edition_protocol/Server_List_Ping
 func PingAndList(addr string) ([]byte, time.Duration, error) {
 	conn, err := mcnet.DialMC(addr)
 	if err != nil {

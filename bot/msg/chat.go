@@ -1,3 +1,13 @@
+// Package msg sends and receives chat. Create a Manager with New after
+// basic.NewPlayer and playerlist.New, and fill EventsHandler with the kinds of
+// message wanted: SystemChat (the server's own messages), PlayerChat (a player's
+// message: who sent it, what they typed, the chat type), DisguisedChat.
+// Manager.SendMessage sends chat, Manager.SendCommand a command.
+//
+// A player's message needs the player list: one from a player it does not list
+// fails as ErrUnknownPlayer and is not delivered. The chat this client sends is
+// unsigned (it has no chat-signing key), which a server that enforces secure
+// chat refuses.
 package msg
 
 import (
@@ -19,7 +29,8 @@ import (
 	"github.com/mj41/go-mc26/protocol/types"
 )
 
-// The Manager is used to receive and send chat messages.
+// Manager receives chat (through the handlers of its EventsHandler) and sends
+// it.
 type Manager struct {
 	c      *bot.Client
 	p      *basic.Player
@@ -29,7 +40,8 @@ type Manager struct {
 	sign.SignatureCache
 }
 
-// New returns a new chat manager.
+// New returns a chat manager: it registers the chat packets' handlers on c and
+// uses pl to tell who sent a message and to verify its signature.
 func New(c *bot.Client, p *basic.Player, pl *playerlist.PlayerList, events EventsHandler) *Manager {
 	m := &Manager{
 		c:              c,
@@ -150,7 +162,7 @@ func (m *Manager) chatDecoration(t *chat.Type) (*chat.ChatTypeDecoration, error)
 	}
 	ct := m.c.Registries.ChatType.GetByID(t.ID)
 	if ct == nil {
-		return nil, InvalidChatPacket{ErrUnknwonChatType}
+		return nil, InvalidChatPacket{ErrUnknownChatType}
 	}
 	return &ct.Chat, nil
 }
@@ -213,24 +225,20 @@ func (m *Manager) SendMessage(msg string) error {
 	return m.c.Conn.WritePacket(pk.Marshal(c.PacketID(), c))
 }
 
-// SendMessage send chat message to server.
-// Doesn't support sending message with signature currently.
+// SendCommand sends a command, without its leading slash ("tp 0 64 0"), as an
+// unsigned chat_command.
 func (m *Manager) SendCommand(command string) error {
 	if len(command) > 256 {
 		return errors.New("message length greater than 256")
 	}
-	var salt int64
-	if err := binary.Read(rand.Reader, binary.BigEndian, &salt); err != nil {
-		return err
-	}
-
 	// 26.x: an unsigned command is just the command string (chat_command);
 	// timestamp/salt/signatures belong to chat_command_signed.
-	_ = salt
 	c := play.ChatCommand{Command: pk.String(command)}
 	return m.c.Conn.WritePacket(pk.Marshal(c.PacketID(), c))
 }
 
+// InvalidChatPacket is a chat packet the manager could not deliver (its sender
+// or chat type unknown); errors.As reaches the reason.
 type InvalidChatPacket struct {
 	err error
 }
@@ -247,7 +255,15 @@ func (i InvalidChatPacket) Unwrap() error {
 }
 
 var (
-	ErrUnknownPlayer          = errors.New("unknown player")
-	ErrUnknwonChatType        = errors.New("unknown chat type")
+	// ErrUnknownPlayer: a player's message from a player the player list does not have.
+	ErrUnknownPlayer = errors.New("unknown player")
+	// ErrUnknownChatType: a message whose chat type the server's registry does not have.
+	ErrUnknownChatType = errors.New("unknown chat type")
+	// ErrUnknwonChatType is ErrUnknownChatType misspelt.
+	//
+	// Deprecated: use ErrUnknownChatType (the same error).
+	ErrUnknwonChatType = ErrUnknownChatType
+	// ErrValidationFailed: a signed message whose signature does not verify; the
+	// vanilla client disconnects with this reason.
 	ErrValidationFailed error = bot.DisconnectErr(chat.TranslateMsg("multiplayer.disconnect.chat_validation_failed"))
 )

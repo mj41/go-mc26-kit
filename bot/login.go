@@ -25,6 +25,8 @@ import (
 	"github.com/mj41/go-mc26/protocol/login"
 )
 
+// LoginErr is a failure of JoinServer before the configuration phase: Stage
+// says where ("connect server", "disconnect", "encrypt start", …).
 type LoginErr struct {
 	Stage string
 	Err   error
@@ -38,7 +40,7 @@ func (l LoginErr) Unwrap() error {
 	return l.Err
 }
 
-func (c *Client) joinLogin(conn *net.Conn) error {
+func (c *Client) joinLogin(conn *net.Conn, options JoinOptions) error {
 	var err error
 	if c.Auth.UUID != "" {
 		c.UUID, err = uuid.Parse(c.Auth.UUID)
@@ -72,7 +74,7 @@ func (c *Client) joinLogin(conn *net.Conn) error {
 			return LoginErr{"disconnect", DisconnectErr(reason)}
 
 		case packetid.ClientboundLoginHello: // Encryption Request
-			if err := handleEncryptionRequest(conn, c, p); err != nil {
+			if err := handleEncryptionRequest(conn, c, p, options); err != nil {
 				return LoginErr{"encryption", err}
 			}
 			receiving = "set compression"
@@ -132,14 +134,16 @@ func (c *Client) joinLogin(conn *net.Conn) error {
 	}
 }
 
-// Auth includes an account
+// Auth is the player a client joins as. An offline-mode server needs only Name
+// (no call to Mojang is made); an online-mode server needs all three, which
+// package microsoft gives.
 type Auth struct {
-	Name string
-	UUID string
-	AsTk string
+	Name string // the player's name
+	UUID string // the profile id, hex, with or without dashes; empty in offline mode
+	AsTk string // the Minecraft access token; empty in offline mode
 }
 
-func handleEncryptionRequest(conn *net.Conn, c *Client, p pk.Packet) error {
+func handleEncryptionRequest(conn *net.Conn, c *Client, p pk.Packet, options JoinOptions) error {
 	// 创建AES对称加密密钥
 	key, encoStream, decoStream := newSymmetricEncryption()
 
@@ -149,14 +153,17 @@ func handleEncryptionRequest(conn *net.Conn, c *Client, p pk.Packet) error {
 		return err
 	}
 
-	err := loginAuth(c.Auth, key, er) // 向Mojang验证
-	if err != nil {
-		return fmt.Errorf("login fail: %v", err)
+	// the session server is told of the join only when the server asks (an online-mode one), as the game's
+	// client does (ClientHandshakePacketListenerImpl: shouldAuthenticate)
+	if er.ShouldAuthenticate {
+		if err := loginAuth(c.Auth, key, er, options); err != nil {
+			return fmt.Errorf("login fail: %v", err)
+		}
 	}
 
 	// 响应加密请求
 	// Write Encryption Key Response
-	p, err = genEncryptionKeyResponse(key, er.PublicKey, er.Challenge)
+	p, err := genEncryptionKeyResponse(key, er.PublicKey, er.Challenge)
 	if err != nil {
 		return fmt.Errorf("gen encryption key response fail: %v", err)
 	}
@@ -173,7 +180,7 @@ func handleEncryptionRequest(conn *net.Conn, c *Client, p pk.Packet) error {
 
 // authDigest computes a special SHA-1 digest required for Minecraft web
 // authentication on Premium servers (online-mode=true).
-// Source: http://wiki.vg/Protocol_Encryption#Server
+// Source: https://minecraft.wiki/w/Java_Edition_protocol/Encryption
 func authDigest(serverID string, sharedSecret, publicKey []byte) string {
 	h := sha1.New()
 	h.Write([]byte(serverID))
@@ -220,7 +227,7 @@ type request struct {
 	ServerID        string  `json:"serverId"`
 }
 
-func loginAuth(auth Auth, shareSecret []byte, er login.ClientboundHello) error {
+func loginAuth(auth Auth, shareSecret []byte, er login.ClientboundHello, options JoinOptions) error {
 	digest := authDigest(string(er.ServerID), shareSecret, er.PublicKey)
 
 	requestPacket, err := json.Marshal(
@@ -237,15 +244,21 @@ func loginAuth(auth Auth, shareSecret []byte, er login.ClientboundHello) error {
 		return fmt.Errorf("create request packet to yggdrasil faile: %v", err)
 	}
 
-	PostRequest, err := http.NewRequest(http.MethodPost, "https://sessionserver.mojang.com/session/minecraft/join",
-		bytes.NewReader(requestPacket))
+	session, client := options.SessionServer, options.HTTPClient
+	if session == "" {
+		session = "https://sessionserver.mojang.com"
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+	PostRequest, err := http.NewRequest(http.MethodPost, session+"/session/minecraft/join", bytes.NewReader(requestPacket))
 	if err != nil {
 		return fmt.Errorf("make request error: %v", err)
 	}
 	PostRequest.Header.Set("User-agent", "go-mc")
 	PostRequest.Header.Set("Connection", "keep-alive")
 	PostRequest.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(PostRequest)
+	resp, err := client.Do(PostRequest)
 	if err != nil {
 		return fmt.Errorf("post fail: %v", err)
 	}

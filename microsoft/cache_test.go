@@ -9,7 +9,7 @@ import (
 func TestTokenCacheRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	cache, err := newTokenCache(t.TempDir(), "mj41", DefaultClientID)
+	cache, err := newTokenCache(t.TempDir(), "steve", DefaultClientID)
 	if err != nil {
 		t.Fatalf("newTokenCache: %v", err)
 	}
@@ -22,7 +22,7 @@ func TestTokenCacheRoundTrip(t *testing.T) {
 			RefreshToken: "refresh",
 			ExpiresIn:    3600,
 		},
-		Profile: &Profile{ID: "abc", Name: "mj41"},
+		Profile: &Profile{ID: "abc", Name: "Steve"},
 	}
 	if err := cache.save(state); err != nil {
 		t.Fatalf("save: %v", err)
@@ -38,7 +38,7 @@ func TestTokenCacheRoundTrip(t *testing.T) {
 	if loaded.Token.RefreshToken != "refresh" {
 		t.Fatalf("unexpected refresh token: %q", loaded.Token.RefreshToken)
 	}
-	if loaded.Profile == nil || loaded.Profile.Name != "mj41" {
+	if loaded.Profile == nil || loaded.Profile.Name != "Steve" {
 		t.Fatalf("unexpected profile: %+v", loaded.Profile)
 	}
 	if filepath.Ext(cache.path) != ".json" {

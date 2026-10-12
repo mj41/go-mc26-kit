@@ -1,13 +1,18 @@
-// Package microsoft resolves Microsoft-backed Minecraft account auth into the
-// existing go-mc bot login inputs.
+// Package microsoft logs a Microsoft account in to Minecraft (Microsoft, then
+// Xbox Live, then Minecraft services) and returns the profile and access token
+// an online-mode server needs: bot.Auth{Name: a.Profile.Name, UUID: a.Profile.ID,
+// AsTk: a.AccessToken()}.
 //
-// The intended workflow is split into two entrypoints:
+// There are two entry points:
 //
-//  1. AuthenticateDeviceCode for interactive device-code bootstrap or cache repair.
-//  2. AuthenticateCached for non-interactive cached-token reuse in automated runs.
+//  1. AuthenticateDeviceCode, interactive: it uses the cached login when there
+//     is one, and otherwise calls Options.OnDeviceCode with a code the user
+//     enters in a browser, then caches the result.
+//  2. AuthenticateCached, for unattended runs: the cached login or
+//     ErrInteractiveLoginRequired, never a prompt.
 //
-// Both return the same Access result so callers can keep the normal online-mode
-// join path and avoid special-case packet/login logic.
+// The cache is under Options.CacheDir (default os.UserCacheDir()/go-mc/microsoft);
+// examples/microsoft is a program that logs in and joins.
 package microsoft
 
 import (
@@ -34,19 +39,53 @@ import (
 )
 
 const (
+	// DefaultClientID is the OAuth client id used when Options.ClientID is empty.
 	DefaultClientID   = "00000000441cc96b"
 	defaultDeviceType = "Nintendo"
 	defaultUserAgent  = "MinecraftLauncher/2.2.10675"
-
-	liveDeviceCodeURL    = "https://login.live.com/oauth20_connect.srf"
-	liveTokenURL         = "https://login.live.com/oauth20_token.srf"
-	xboxUserAuthURL      = "https://user.auth.xboxlive.com/user/authenticate"
-	xboxDeviceAuthURL    = "https://device.auth.xboxlive.com/device/authenticate"
-	xboxTitleAuthURL     = "https://title.auth.xboxlive.com/title/authenticate"
-	xboxXSTSAuthorizeURL = "https://xsts.auth.xboxlive.com/xsts/authorize"
-	mcLoginWithXboxURL   = "https://api.minecraftservices.com/authentication/login_with_xbox"
-	mcProfileURL         = "https://api.minecraftservices.com/minecraft/profile"
 )
+
+// Endpoints are the services a login talks to, one URL each; a field left empty is the real service's
+// (DefaultEndpoints). A test points them at a fake.
+type Endpoints struct {
+	LiveDeviceCode   string // Microsoft's device code
+	LiveToken        string // Microsoft's token: the device code's poll, a refresh
+	XboxUser         string // Xbox Live user authentication
+	XboxDevice       string // Xbox Live device authentication
+	XboxTitle        string // Xbox Live title authentication
+	XboxXSTS         string // Xbox Live XSTS authorization
+	MinecraftLogin   string // Minecraft services: login with Xbox
+	MinecraftProfile string // Minecraft services: the profile
+}
+
+// DefaultEndpoints are the real services.
+var DefaultEndpoints = Endpoints{
+	LiveDeviceCode:   "https://login.live.com/oauth20_connect.srf",
+	LiveToken:        "https://login.live.com/oauth20_token.srf",
+	XboxUser:         "https://user.auth.xboxlive.com/user/authenticate",
+	XboxDevice:       "https://device.auth.xboxlive.com/device/authenticate",
+	XboxTitle:        "https://title.auth.xboxlive.com/title/authenticate",
+	XboxXSTS:         "https://xsts.auth.xboxlive.com/xsts/authorize",
+	MinecraftLogin:   "https://api.minecraftservices.com/authentication/login_with_xbox",
+	MinecraftProfile: "https://api.minecraftservices.com/minecraft/profile",
+}
+
+// or is e with its empty fields DefaultEndpoints'.
+func (e Endpoints) or() Endpoints {
+	d := DefaultEndpoints
+	pick := func(v, def string) string {
+		if v != "" {
+			return v
+		}
+		return def
+	}
+	return Endpoints{
+		LiveDeviceCode: pick(e.LiveDeviceCode, d.LiveDeviceCode), LiveToken: pick(e.LiveToken, d.LiveToken),
+		XboxUser: pick(e.XboxUser, d.XboxUser), XboxDevice: pick(e.XboxDevice, d.XboxDevice),
+		XboxTitle: pick(e.XboxTitle, d.XboxTitle), XboxXSTS: pick(e.XboxXSTS, d.XboxXSTS),
+		MinecraftLogin: pick(e.MinecraftLogin, d.MinecraftLogin), MinecraftProfile: pick(e.MinecraftProfile, d.MinecraftProfile),
+	}
+}
 
 var xboxLiveErrors = map[int64]string{
 	2148916227: "your account was banned by Xbox for violating one or more community standards",
@@ -59,20 +98,26 @@ var xboxLiveErrors = map[int64]string{
 	2148916238: "the account is under 18 and must be added to a family by an adult",
 }
 
+// ErrInteractiveLoginRequired is AuthenticateCached's answer when no cached login
+// can be used: run AuthenticateDeviceCode once.
 var ErrInteractiveLoginRequired = errors.New("microsoft auth requires interactive device-code approval")
 
+// Options of a login; the zero value works.
 type Options struct {
-	ClientID      string
-	DeviceType    string
-	DeviceVersion string
-	HTTPClient    *http.Client
-	CacheDir      string
-	CacheKey      string
-	ForceRefresh  bool
-	OnDeviceCode  func(DeviceCode)
-	OnStatus      func(string)
+	ClientID      string           // the OAuth client id; empty: DefaultClientID
+	DeviceType    string           // the Xbox device type presented; empty: the default
+	DeviceVersion string           // the Xbox device version presented; empty: the default
+	HTTPClient    *http.Client     // empty: one of the package's own
+	CacheDir      string           // where logins are cached; empty: os.UserCacheDir()/go-mc/microsoft
+	CacheKey      string           // separates the cached logins of several accounts
+	ForceRefresh  bool             // ignore the cache and log in again
+	OnDeviceCode  func(DeviceCode) // shows the user the code to enter (DeviceCode.Message says where)
+	OnStatus      func(string)     // progress messages, for a log
+	Endpoints     Endpoints        // the services; empty fields: the real ones
 }
 
+// DeviceCode is what the user is asked to do: open VerificationURI and enter
+// UserCode; Message says it in a sentence.
 type DeviceCode struct {
 	UserCode        string `json:"user_code"`
 	DeviceCode      string `json:"device_code"`
@@ -82,6 +127,7 @@ type DeviceCode struct {
 	Message         string `json:"message"`
 }
 
+// Profile is the Minecraft profile of the account: its id and name.
 type Profile struct {
 	ID    string `json:"id"`
 	Name  string `json:"name"`
@@ -89,15 +135,18 @@ type Profile struct {
 	Capes []any  `json:"capes,omitempty"`
 }
 
+// Access is a login's result: the Minecraft access token and the profile.
 type Access struct {
 	Token   string
 	Profile Profile
 }
 
+// SelectedProfile returns the profile's id and name.
 func (a *Access) SelectedProfile() (ID, Name string) {
 	return a.Profile.ID, a.Profile.Name
 }
 
+// AccessToken returns the Minecraft access token (bot.Auth.AsTk).
 func (a *Access) AccessToken() string {
 	return a.Token
 }
@@ -152,6 +201,7 @@ type flow struct {
 	onStatus   func(string)
 	key        *ecdsa.PrivateKey
 	jwk        jwk
+	ep         Endpoints
 }
 
 type jwk struct {
@@ -169,10 +219,14 @@ type xboxXSTS struct {
 	Token    string
 }
 
+// AuthenticateDeviceCode logs in with the cached login, or else interactively
+// by a device code (Options.OnDeviceCode), and caches the result.
 func AuthenticateDeviceCode(ctx context.Context, opts Options) (*Access, error) {
 	return authenticate(ctx, opts, true)
 }
 
+// AuthenticateCached logs in with the cached login only; without one it returns
+// ErrInteractiveLoginRequired.
 func AuthenticateCached(ctx context.Context, opts Options) (*Access, error) {
 	return authenticate(ctx, opts, false)
 }
@@ -269,6 +323,7 @@ func newFlow(opts Options) (*flow, error) {
 		onStatus:   opts.OnStatus,
 		key:        key,
 		jwk:        publicJWK(key),
+		ep:         opts.Endpoints.or(),
 	}, nil
 }
 
@@ -292,7 +347,7 @@ func (f *flow) acquireLiveToken(ctx context.Context, allowInteractive bool) (*li
 	form.Set("response_type", "device_code")
 
 	var code DeviceCode
-	if err := f.doFormJSON(ctx, http.MethodPost, liveDeviceCodeURL, form, nil, &code); err != nil {
+	if err := f.doFormJSON(ctx, http.MethodPost, f.ep.LiveDeviceCode, form, nil, &code); err != nil {
 		return nil, err
 	}
 	code.Message = fmt.Sprintf("To sign in, use a web browser to open the page %s and use the code %s or visit http://microsoft.com/link?otc=%s", code.VerificationURI, code.UserCode, code.UserCode)
@@ -320,7 +375,7 @@ func (f *flow) acquireLiveToken(ctx context.Context, allowInteractive bool) (*li
 		pollForm.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
 
 		var token liveTokenResponse
-		tokenURL := liveTokenURL + "?client_id=" + url.QueryEscape(f.clientID)
+		tokenURL := f.ep.LiveToken + "?client_id=" + url.QueryEscape(f.clientID)
 		status, err := f.doFormJSONAnyStatus(ctx, http.MethodPost, tokenURL, pollForm, nil, &token)
 		if err != nil {
 			return nil, err
@@ -393,7 +448,7 @@ func (f *flow) refreshLiveToken(ctx context.Context, refreshToken string) (*live
 	form.Set("refresh_token", refreshToken)
 
 	var token liveTokenResponse
-	status, err := f.doFormJSONAnyStatus(ctx, http.MethodPost, liveTokenURL, form, nil, &token)
+	status, err := f.doFormJSONAnyStatus(ctx, http.MethodPost, f.ep.LiveToken, form, nil, &token)
 	if err != nil {
 		return nil, err
 	}
@@ -420,7 +475,7 @@ func (f *flow) getUserToken(ctx context.Context, msaAccessToken string) (string,
 		},
 	}
 
-	body, headers, err := f.signedJSONRequest(xboxUserAuthURL, payload)
+	body, headers, err := f.signedJSONRequest(f.ep.XboxUser, payload)
 	if err != nil {
 		return "", err
 	}
@@ -428,7 +483,7 @@ func (f *flow) getUserToken(ctx context.Context, msaAccessToken string) (string,
 	headers.Set("x-xbl-contract-version", "2")
 
 	var resp xboxUserTokenResponse
-	if err := f.doJSON(ctx, http.MethodPost, xboxUserAuthURL, body, headers, &resp); err != nil {
+	if err := f.doJSON(ctx, http.MethodPost, f.ep.XboxUser, body, headers, &resp); err != nil {
 		return "", err
 	}
 	if resp.Token == "" {
@@ -451,13 +506,13 @@ func (f *flow) getDeviceToken(ctx context.Context) (string, error) {
 		"TokenType":    "JWT",
 	}
 
-	body, headers, err := f.signedJSONRequest(xboxDeviceAuthURL, payload)
+	body, headers, err := f.signedJSONRequest(f.ep.XboxDevice, payload)
 	if err != nil {
 		return "", err
 	}
 
 	var resp xboxUserTokenResponse
-	if err := f.doJSON(ctx, http.MethodPost, xboxDeviceAuthURL, body, headers, &resp); err != nil {
+	if err := f.doJSON(ctx, http.MethodPost, f.ep.XboxDevice, body, headers, &resp); err != nil {
 		return "", err
 	}
 	if resp.Token == "" {
@@ -479,13 +534,13 @@ func (f *flow) getTitleToken(ctx context.Context, msaAccessToken, deviceToken st
 		"TokenType":    "JWT",
 	}
 
-	body, headers, err := f.signedJSONRequest(xboxTitleAuthURL, payload)
+	body, headers, err := f.signedJSONRequest(f.ep.XboxTitle, payload)
 	if err != nil {
 		return "", err
 	}
 
 	var resp xboxUserTokenResponse
-	if err := f.doJSON(ctx, http.MethodPost, xboxTitleAuthURL, body, headers, &resp); err != nil {
+	if err := f.doJSON(ctx, http.MethodPost, f.ep.XboxTitle, body, headers, &resp); err != nil {
 		return "", err
 	}
 	if resp.Token == "" {
@@ -507,13 +562,13 @@ func (f *flow) getXSTSToken(ctx context.Context, userToken, deviceToken, titleTo
 		},
 	}
 
-	body, headers, err := f.signedJSONRequest(xboxXSTSAuthorizeURL, payload)
+	body, headers, err := f.signedJSONRequest(f.ep.XboxXSTS, payload)
 	if err != nil {
 		return nil, err
 	}
 
 	var resp xboxXSTSResponse
-	if err := f.doJSON(ctx, http.MethodPost, xboxXSTSAuthorizeURL, body, headers, &resp); err != nil {
+	if err := f.doJSON(ctx, http.MethodPost, f.ep.XboxXSTS, body, headers, &resp); err != nil {
 		return nil, err
 	}
 	if resp.XErr != 0 {
@@ -544,7 +599,7 @@ func (f *flow) loginWithXbox(ctx context.Context, xsts *xboxXSTS) (string, error
 	headers := makeJSONHeaders()
 
 	var resp minecraftAuthResponse
-	if err := f.doJSON(ctx, http.MethodPost, mcLoginWithXboxURL, body, headers, &resp); err != nil {
+	if err := f.doJSON(ctx, http.MethodPost, f.ep.MinecraftLogin, body, headers, &resp); err != nil {
 		return "", err
 	}
 	if resp.Error != "" {
@@ -562,7 +617,7 @@ func (f *flow) fetchProfile(ctx context.Context, token string) (Profile, error) 
 	headers.Set("User-Agent", defaultUserAgent)
 
 	var profile Profile
-	if err := f.doJSON(ctx, http.MethodGet, mcProfileURL, nil, headers, &profile); err != nil {
+	if err := f.doJSON(ctx, http.MethodGet, f.ep.MinecraftProfile, nil, headers, &profile); err != nil {
 		return Profile{}, err
 	}
 	if profile.ID == "" || profile.Name == "" {

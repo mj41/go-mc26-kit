@@ -1,3 +1,6 @@
+// Package offline computes the uuid an offline-mode server (online-mode=false)
+// gives a player name, as vanilla does: a version-3 uuid of "OfflinePlayer:" and
+// the name.
 package offline
 
 import (
@@ -6,7 +9,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// NameToUUID return the UUID from player name in offline mode
+// NameToUUID returns the uuid an offline-mode server gives the player name.
 func NameToUUID(name string) uuid.UUID {
 	version := 3
 	h := md5.New()

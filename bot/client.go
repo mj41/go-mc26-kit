@@ -36,22 +36,23 @@ type Client struct {
 	ConfigHandler
 
 	CustomReportDetails map[string]string
+
+	census census // what the server sent, by packet id (Census)
 }
 
 // CustomPayloadHandler is a function handling custom payload
 type CustomPayloadHandler func(data []byte) ([]byte, error)
 
+// Close closes the connection to the server; HandleGame then returns. It is
+// safe from another goroutine (a signal handler, say).
 func (c *Client) Close() error {
 	return c.Conn.Close()
 }
 
-// NewClient init and return a new Client.
-//
-// A new Client has default name "Steve" and zero UUID.
-// It is usable for an offline-mode game.
-//
-// For online-mode, you need login your Mojang account
-// and load your Name, UUID and AccessToken to client.
+// NewClient returns a new Client, ready for an offline-mode server under the
+// name "Steve" (set Auth.Name to choose another). For an online-mode server,
+// log in with package microsoft and fill Auth with its Name, UUID and access
+// token.
 func NewClient() *Client {
 	return &Client{
 		Auth:                Auth{Name: "Steve"},
@@ -70,9 +71,18 @@ type Conn struct {
 	send, recv queue.Queue[pk.Packet]
 	pool       sync.Pool // pool of recv packet data
 	rerr       error
+
+	// phase is held while a packet is queued: from the server's StartConfiguration till the configuration
+	// finishes (configuring), a play-phase writer — the controller's ticks, a chat — waits, as the game's
+	// client sends nothing of play then, and the server reads configuration; only the configuration's own
+	// packets go (configWriter).
+	phase       sync.Mutex
+	phaseChange *sync.Cond
+	configuring bool
+	closed      bool
 }
 
-func warpConn(c *net.Conn, qr, qw queue.Queue[pk.Packet]) *Conn {
+func warpConn(c *net.Conn, qr, qw queue.Queue[pk.Packet], read func(pk.Packet)) *Conn {
 	wc := Conn{
 		Conn: c,
 		send: qw,
@@ -80,6 +90,7 @@ func warpConn(c *net.Conn, qr, qw queue.Queue[pk.Packet]) *Conn {
 		pool: sync.Pool{New: func() any { return []byte{} }},
 		rerr: nil,
 	}
+	wc.phaseChange = sync.NewCond(&wc.phase)
 	go func() {
 		for {
 			// take a buffer from pool, after the packet is handled we put it back
@@ -87,6 +98,9 @@ func warpConn(c *net.Conn, qr, qw queue.Queue[pk.Packet]) *Conn {
 			if err := c.ReadPacket(&p); err != nil {
 				wc.rerr = err
 				break
+			}
+			if read != nil {
+				read(p) // what must not wait for HandleGame (Events.AddReadHook)
 			}
 			if ok := wc.recv.Push(p); !ok {
 				wc.rerr = errors.New("receive queue is full")
@@ -119,15 +133,45 @@ func (c *Conn) ReadPacket(p *pk.Packet) error {
 	return nil
 }
 
+// WritePacket queues a packet to the server. While the server has the connection back in its configuration
+// phase it waits, and goes when play resumes.
 func (c *Conn) WritePacket(p pk.Packet) error {
-	ok := c.send.Push(p)
-	if !ok {
+	c.phase.Lock()
+	defer c.phase.Unlock()
+	for c.configuring && !c.closed {
+		c.phaseChange.Wait()
+	}
+	return c.push(p)
+}
+
+func (c *Conn) push(p pk.Packet) error {
+	if ok := c.send.Push(p); !ok {
 		return errors.New("queue is full")
 	}
 	return nil
 }
 
+// configure starts (on) or ends the configuration phase the server took the connection back to: the play
+// phase's writers wait meanwhile. Started before the acknowledgement, so no play packet follows it.
+func (c *Conn) configure(on bool) {
+	c.phase.Lock()
+	c.configuring = on
+	c.phase.Unlock()
+	if !on {
+		c.phaseChange.Broadcast()
+	}
+}
+
+// configWriter writes the configuration phase's packets past the wait of WritePacket.
+type configWriter struct{ *Conn }
+
+func (c configWriter) WritePacket(p pk.Packet) error { return c.push(p) }
+
 func (c *Conn) Close() error {
+	c.phase.Lock()
+	c.closed = true
+	c.phase.Unlock()
+	c.phaseChange.Broadcast() // a writer waiting for play goes, and finds the connection closed
 	c.send.Close()
 	return c.Conn.Close()
 }

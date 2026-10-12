@@ -143,9 +143,27 @@ func (p *Player) handleSetEntityMotion(packet pk.Packet) error {
 	return nil
 }
 
+// handleExplode adds an explosion's push of the player to its velocity
+// (ClientPacketListener.handleExplosion: addDeltaMovement of the player knockback).
+func (p *Player) handleExplode(packet pk.Packet) error {
+	var x play.Explode
+	if err := packet.Scan(&x); err != nil {
+		return Error{err}
+	}
+	if !x.PlayerKnockback.Has {
+		return nil
+	}
+	k := x.PlayerKnockback.Val
+	p.mu.Lock()
+	p.pos.VX, p.pos.VY, p.pos.VZ = p.pos.VX+float64(k.X), p.pos.VY+float64(k.Y), p.pos.VZ+float64(k.Z)
+	p.mu.Unlock()
+	return nil
+}
+
 func (p *Player) attachPosition() {
 	p.c.Events.AddListener(
 		bot.PacketHandler{Priority: 100, ID: packetid.ClientboundPlaySetEntityMotion, F: p.handleSetEntityMotion},
+		bot.PacketHandler{Priority: 100, ID: packetid.ClientboundPlayExplode, F: p.handleExplode},
 		bot.PacketHandler{Priority: 100, ID: packetid.ClientboundPlayPlayerPosition, F: p.handlePlayerPosition},
 		bot.PacketHandler{Priority: 100, ID: packetid.ClientboundPlayPlayerRotation, F: p.handlePlayerRotation},
 	)
