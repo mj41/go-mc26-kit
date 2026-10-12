@@ -12,6 +12,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"slices"
+	"sync"
 	"time"
 
 	//"github.com/mattn/go-colorable"
@@ -21,6 +23,8 @@ import (
 	"github.com/mj41/go-mc26-kit/bot/msg"
 	"github.com/mj41/go-mc26-kit/bot/playerlist"
 	"github.com/mj41/go-mc26/chat"
+	"github.com/mj41/go-mc26/data/packetid"
+	"github.com/mj41/go-mc26/data/registryid"
 	"github.com/mj41/go-mc26/data/soundid"
 	pk "github.com/mj41/go-mc26/net/packet"
 	"github.com/mj41/go-mc26/protocol/play"
@@ -41,7 +45,7 @@ var (
 	playerList  *playerlist.PlayerList
 	chatHandler *msg.Manager
 
-	watch   chan time.Time  // a reel, told to the watchdog
+	watch   chan struct{}   // a bite reeled in, told to the watchdog: it casts again once the bobber is gone
 	running context.Context // run's: its end stops the watchdog
 )
 
@@ -59,6 +63,7 @@ func main() {
 // for a real server (a test gives a fake server's in-memory dialer).
 func run(ctx context.Context, address, name string, opts bot.JoinOptions) error {
 	running = ctx
+	resetBobber()
 	c = bot.NewClient()
 	c.Auth.Name = name
 	p = basic.NewPlayer(c, basic.DefaultSettings, basic.EventsListener{
@@ -75,7 +80,7 @@ func run(ctx context.Context, address, name string, opts bot.JoinOptions) error 
 
 	// Register event handlers
 
-	c.Events.AddListener(soundListener)
+	c.Events.AddListener(soundListener, bobberAdded, bobberRemoved)
 
 	// Login
 	if err := c.JoinServerWithOptions(address, opts); err != nil {
@@ -111,7 +116,7 @@ func onDeath() error {
 func onGameStart() error {
 	log.Println("Game start")
 
-	watch = make(chan time.Time, 1)
+	watch = make(chan struct{}, 1)
 	go watchDog(running)
 
 	return UseItem(types.InteractionHandMainHand)
@@ -132,6 +137,88 @@ var soundListener = bot.PacketHandler{
 	},
 }
 
+// float is whether the bot's bobber is in the water, as the server says it: an entity of type fishing_bobber whose data
+// is the bot's own entity id (its owner) was added and not yet removed. The bot does not assume it — a cast with no rod in
+// the hand (the game start, before the rod is given) puts none out — it asks this before it reels in or casts.
+var float struct {
+	mu  sync.Mutex
+	id  int32         // the bobber's entity id; 0: none out
+	ch  chan struct{} // closed when the state changes (and made again)
+	own int32         // the bot's entity id
+}
+
+// resetBobber is the state of a run that begins: none out, a channel made inside the run (a test's bubble owns it).
+func resetBobber() {
+	float.mu.Lock()
+	defer float.mu.Unlock()
+	float.id, float.ch = 0, make(chan struct{})
+}
+
+func floatChanged() {
+	close(float.ch)
+	float.ch = make(chan struct{})
+}
+
+var bobberType = slices.Index(registryid.EntityType, "minecraft:fishing_bobber")
+
+var bobberAdded = bot.PacketHandler{ID: packetid.ClientboundPlayAddEntity, F: func(pk_ pk.Packet) error {
+	var a play.AddEntity
+	if err := pk_.Scan(&a); err != nil {
+		return nil // (one read wrong is no reason to drop the connection)
+	}
+	if int(a.Type) != bobberType || int32(a.Data) != int32(p.Login.PlayerID) {
+		return nil
+	}
+	float.mu.Lock()
+	float.id = int32(a.ID)
+	floatChanged()
+	float.mu.Unlock()
+	return nil
+}}
+
+var bobberRemoved = bot.PacketHandler{ID: packetid.ClientboundPlayRemoveEntities, F: func(pk_ pk.Packet) error {
+	var r play.RemoveEntities
+	if err := pk_.Scan(&r); err != nil {
+		return nil
+	}
+	float.mu.Lock()
+	defer float.mu.Unlock()
+	for _, id := range r.EntityIds {
+		if float.id != 0 && int32(id) == float.id {
+			float.id = 0
+			floatChanged()
+		}
+	}
+	return nil
+}}
+
+// bobberOut is whether the bot's bobber is out now.
+func bobberOut() bool {
+	float.mu.Lock()
+	defer float.mu.Unlock()
+	return float.id != 0
+}
+
+// waitBobber waits (at most limit, or till ctx ends) for the bobber to be out, or gone: whether it is.
+func waitBobber(ctx context.Context, out bool, limit time.Duration) bool {
+	deadline := time.After(limit)
+	for {
+		float.mu.Lock()
+		ok, ch := (float.id != 0) == out, float.ch
+		float.mu.Unlock()
+		if ok {
+			return true
+		}
+		select {
+		case <-ch:
+		case <-deadline:
+			return false
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
 func UseItem(hand types.InteractionHand) error {
 	use := play.UseItem{Hand: hand} // sequence 0, no rotation
 	return c.Conn.WritePacket(pk.Marshal(use.PacketID(), use))
@@ -142,16 +229,17 @@ func onSound(id int, category int, x, y, z float64, volume, pitch float32) error
 	// A bite is the bobber's splash, matched by name: a sound's registry id moves between versions (609 in
 	// an older one, 644 in 26.3), so a number here stops recognising the bite.
 	if name, _ := soundid.GetSoundNameByID(soundid.SoundID(id)); name == "entity.fishing_bobber.splash" {
+		if !bobberOut() {
+			return nil // a splash that is no bite of ours: our bobber is not out
+		}
 		if err := UseItem(types.InteractionHandMainHand); err != nil { // retrieve
 			return err
 		}
 		log.Println("gra~")
-		time.Sleep(time.Millisecond * 300)
-		if err := UseItem(types.InteractionHandMainHand); err != nil { // throw
-			return err
-		}
+		// the cast again waits, in the watchdog's goroutine, for the server to say the bobber is gone: this handler
+		// runs the packets, and the word is the next of them
 		select {
-		case watch <- time.Now():
+		case watch <- struct{}{}:
 		default: // (one already told)
 		}
 	}
@@ -178,7 +266,9 @@ func onDisconnect(c chat.Message) error {
 	return nil
 }
 
-// watchDog casts again when no fish has bitten for timeout seconds, till ctx ends.
+// watchDog casts again — once the bobber is gone — after each bite reeled in, and when no fish has bitten for timeout
+// seconds, till ctx ends. It asks the server's word (bobberOut), it does not assume it: a cast with no rod in the hand puts
+// no bobber out, and the use that was meant to reel it in would cast.
 func watchDog(ctx context.Context) {
 	to := time.NewTimer(time.Second * timeout)
 	defer to.Stop()
@@ -188,17 +278,28 @@ func watchDog(ctx context.Context) {
 			return
 		case <-watch:
 		case <-to.C:
-			// with the bobber out a use reels it in, so casting again is two: one use alone would leave
-			// no line in the water till the next timeout
 			log.Println("rethrow")
-			err := UseItem(types.InteractionHandMainHand) // reel in
-			if err == nil {
-				time.Sleep(time.Millisecond * 300)
-				err = UseItem(types.InteractionHandMainHand) // cast
+			if bobberOut() {
+				if err := UseItem(types.InteractionHandMainHand); err != nil { // reel in
+					log.Print("rethrow: ", err) // the connection is gone
+					return
+				}
 			}
-			if err != nil {
-				log.Print("rethrow: ", err) // the connection is gone
+		}
+		// the line out is cast only when none is: a use with the bobber out would reel it in
+		if !waitBobber(ctx, false, 10*time.Second) {
+			if ctx.Err() != nil {
 				return
+			}
+			log.Println("the bobber is still out after the reel: not cast again")
+		} else if err := UseItem(types.InteractionHandMainHand); err != nil { // cast
+			log.Print("cast: ", err)
+			return
+		}
+		if !to.Stop() {
+			select {
+			case <-to.C:
+			default:
 			}
 		}
 		to.Reset(time.Second * timeout)

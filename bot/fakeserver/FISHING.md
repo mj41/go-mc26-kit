@@ -19,7 +19,7 @@ keeps it fixed.
 ## The model
 
 The fishing is in a fake-server field, `Fishing *Fishing`; nil, as by default, means no fishing. The
-player holds a rod, and nothing checks it: the fake server keeps no inventory.
+player holds a rod, and nothing checks it: the fake server keeps no inventory. (Built since: `Fishing.Rod` and `GiveRod`; a use with no rod does nothing, as the game's.)
 
 - **Cast**: a `UseItem` with no bobber out. The server spawns the bobber (`AddEntity`, type
   `minecraft:fishing_bobber`, its data the player's entity id) a few blocks in front of the player, and

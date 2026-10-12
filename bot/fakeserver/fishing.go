@@ -15,9 +15,13 @@ import (
 
 // Fishing is the fake server's fishing, as much as a fishing bot needs (FISHING.md): a UseItem with no
 // bobber out casts it, the splash of a bite comes BiteAfter later, and a UseItem within Hooked of the bite
-// reels in a catch (a cod, told as a slot's new stack). The player's rod is not checked, and one bobber is
-// out at a time. Set Server.Fishing before the player joins.
+// reels in a catch (a cod, told as a slot's new stack). A UseItem with no fishing rod in the player's hand
+// does nothing, as the game's does (a cast at the game start, before a harness gives the rod, is ignored): the
+// player holds one from the start when Rod is set, else from GiveRod. One bobber is out at a time. Set
+// Server.Fishing before the player joins.
 type Fishing struct {
+	Rod bool // the player holds a fishing rod from the start
+
 	BiteAfter time.Duration // the wait for a bite (0: 5 s, the low end of the game's 5 to 30 s)
 	Hooked    time.Duration // how long a fish stays on (0: 1 s, the game's 20 to 40 ticks)
 
@@ -26,6 +30,22 @@ type Fishing struct {
 	bitAt  time.Time   // when the fish on the hook bit; zero: none on
 	timer  *time.Timer // the next bite, or the fish getting away
 	caught int
+}
+
+// GiveRod puts a fishing rod in the player's main hand (the hotbar's first slot), as /give does, and tells the player.
+func (f *Fishing) GiveRod(p *Player) {
+	f.mu.Lock()
+	f.Rod = true
+	f.mu.Unlock()
+	rod := types.ItemStack{SlotData: component.SlotData{Count: 1, Item: pk.VarInt(slices.Index(registryid.Item, "minecraft:fishing_rod"))}}
+	_ = p.Send(play.ContainerSetSlot{ContainerID: 0, Slot: 36, ItemStack: rod})
+}
+
+// Out is whether a bobber is in the water.
+func (f *Fishing) Out() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.bobber != 0
 }
 
 // Caught is how many fish were reeled in.
@@ -52,6 +72,9 @@ var bobberAt = [3]float64{Spawn[0], Spawn[1], Spawn[2] + 4}
 func (f *Fishing) use(s *Server, p *Player) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if !f.Rod { // no rod in the hand: the use does nothing
+		return
+	}
 	if f.bobber == 0 { // cast
 		s.mu.Lock()
 		s.lastID++
