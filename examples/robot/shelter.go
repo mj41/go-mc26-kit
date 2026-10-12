@@ -833,6 +833,24 @@ func (r *robot) sealShell(m room) {
 		add(along, 0, -1)
 	}
 	sealed := 0
+	var overHead []world.BlockPos // leaves in the column the robot stands in: dug from another cell of the room
+	seal := func(c world.BlockPos, leaf bool) bool {
+		if leaf {
+			if err := r.clear(c); err != nil {
+				if errors.Is(err, errOwnColumn) {
+					overHead = append(overHead, c)
+				} else {
+					plan("shelter: clear %v: %v", c, err)
+				}
+				return false
+			}
+		}
+		if err := r.fill(c); err != nil {
+			plan("shelter: seal %v: %v", c, err)
+			return false
+		}
+		return true
+	}
 	for _, c := range shell {
 		s, ok := r.world.BlockAt(c)
 		if !ok {
@@ -842,18 +860,84 @@ func (r *robot) sealShell(m room) {
 		if !leaf && !r.openAt(c) {
 			continue
 		}
-		if leaf {
-			if err := r.clear(c); err != nil {
-				continue
-			}
+		if seal(c, leaf) {
+			sealed++
 		}
-		if err := r.fill(c); err != nil {
-			plan("shelter: seal %v: %v", c, err)
+	}
+	// a leaf over the robot's head (the roof over the room's middle, where it stands) is not dug from under it:
+	// from another cell of the room, then back
+	for _, c := range overHead {
+		aside := m.cell(2, 0, 0)
+		if aside.X == c.X && aside.Z == c.Z {
+			aside = m.cell(4, 0, 0)
+		}
+		if err := r.goToLevel(aside); err != nil {
+			plan("shelter: aside to %v: %v", aside, err)
 			continue
 		}
-		sealed++
+		if seal(c, true) {
+			sealed++
+		}
+	}
+	if len(overHead) > 0 {
+		if err := r.goToLevel(m.centre()); err != nil {
+			plan("shelter: back to the room's middle: %v", err)
+		}
 	}
 	if sealed > 0 {
 		plan("shelter: %d cells of its shell sealed (open or leaves)", sealed)
+	}
+	r.sealRingLeaves(m, shell)
+}
+
+// sealRingLeaves takes the leaves out of the cells round the shell, those that touch the room only along an edge
+// (the roof's edge over the way in, the corners of the floor), and puts cobblestone there. Nothing passes through
+// such a cell, but a hill under a tree has leaves in them, and leaves decay once the tree's logs are cut (the
+// robot cuts them for its wood before the shelter): the roof's corner is then open, a hole beside the room that a
+// mob can stand in, and a check of the room finds it open.
+func (r *robot) sealRingLeaves(m room, shell []world.BlockPos) {
+	skip := map[world.BlockPos]bool{}
+	for _, c := range shell {
+		skip[c] = true
+	}
+	for along := 2; along <= 4; along++ { // the room
+		for side := -1; side <= 1; side++ {
+			for dy := 0; dy <= 1; dy++ {
+				skip[m.cell(along, side, dy)] = true
+			}
+		}
+	}
+	for _, along := range []int{1, 5} { // the way in and the tunnel's first cell
+		for dy := 0; dy <= 1; dy++ {
+			skip[m.cell(along, 0, dy)] = true
+		}
+	}
+	sealed := 0
+	for along := 1; along <= 5; along++ {
+		for side := -2; side <= 2; side++ {
+			if (along == 1 || along == 5) && (side == -2 || side == 2) {
+				continue // a corner of the box: touches nothing of the room
+			}
+			for dy := -1; dy <= 2; dy++ {
+				c := m.cell(along, side, dy)
+				if skip[c] {
+					continue
+				}
+				if s, ok := r.world.BlockAt(c); !ok || !strings.HasSuffix(blockID(s), "_leaves") {
+					continue
+				}
+				if err := r.clear(c); err != nil {
+					continue
+				}
+				if err := r.fill(c); err != nil {
+					plan("shelter: seal %v: %v", c, err)
+					continue
+				}
+				sealed++
+			}
+		}
+	}
+	if sealed > 0 {
+		plan("shelter: %d leaf cells round its shell sealed", sealed)
 	}
 }
