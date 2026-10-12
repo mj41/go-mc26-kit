@@ -93,6 +93,12 @@ func (r *robot) headHome() error {
 // nothing out there after dark — out already, it heads home (or hides);
 // in, it stays in. It answers errLate when the work is for tomorrow.
 func (r *robot) dayWork() error {
+	// the order over (stopped as stuck, the robot dead): the loops of outdoor
+	// work that go on past each cell they cannot do end here (a plot's dig
+	// loop once tried cell after cell for three minutes, stopped)
+	if err := r.orderOver(); err != nil {
+		return err
+	}
 	if r.home != nil && r.night() && !r.hiding {
 		if r.underSky() {
 			return r.headHome()
@@ -101,6 +107,15 @@ func (r *robot) dayWork() error {
 	}
 	if r.lateOut() {
 		return r.headHome()
+	}
+	// hurt: healed before the work out there, as a person does — the mobs
+	// left from the night meet it in the morning (it once set off to the
+	// rings at 13.7 health, and a creeper's blast at 9.7 killed it)
+	if r.player.Status().Health < 14 && !r.inReflex && !r.healing && (r.food.Load() >= 18 || r.countAll(foods) > 0) {
+		r.healing = true
+		r.eatIfHungry()
+		r.rest(16)
+		r.healing = false
 	}
 	r.outFirst()
 	return nil

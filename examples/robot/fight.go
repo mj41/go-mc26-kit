@@ -163,7 +163,7 @@ func (r *robot) fightWhere(radius float64, limit time.Duration, want func(entiti
 			if e.Type == "minecraft:creeper" {
 				r.walker.Stop()
 				log.Printf("robot: a creeper at %.1f %.1f %.1f: away from it", e.X, e.Y, e.Z)
-				r.retreat(e.X, e.Z)
+				r.awayFromCreeper(e)
 				events.emit("fight", map[string]any{"against": e.Type, "killed": 0, "fled": true})
 				break
 			}
@@ -182,10 +182,24 @@ func (r *robot) fightWhere(radius float64, limit time.Duration, want func(entiti
 		// or in a tunnel, the mob follows and hits it from behind; against
 		// two it goes at twelve, three or more at sixteen (a zombie with a
 		// sword hits for ten)
+		// — unless a retreat just got nowhere (down its stairs' tunnel, the
+		// mobs after it): then it stands and fights, as a person cornered
+		// does (it once ran on the spot for two seconds, two zombies hitting
+		// it, retreat after retreat, till it died)
 		n := r.hostilesNear(p.X, p.Y, p.Z, 8)
-		if h := r.player.Status().Health; h > 0 && target != nil && !r.onBridge && (h <= 6 || h <= 12 && n >= 2 || h <= 16 && n >= 3) {
+		if h := r.player.Status().Health; h > 0 && target != nil && !r.onBridge && time.Now().After(r.standUntil) && (h <= 6 || h <= 12 && n >= 2 || h <= 16 && n >= 3) {
 			r.walker.Stop()
-			r.retreat(target.X, target.Z)
+			if !r.retreat(target.X, target.Z) {
+				// low, and a mob that strikes (not shoots): up two blocks out of
+				// its reach, as a person does — fighting on at three and a
+				// half health, no weapon, a zombie killed it
+				if h <= 8 && !rangedType(target.Type) && r.escapeUp(target.Type) {
+					return killed, fmt.Errorf("up a pillar from the %s, health %.1f (killed %d)", target.Type, h, killed)
+				}
+				r.standUntil = time.Now().Add(20 * time.Second)
+				plan("fight: no way away from the %s (health %.1f): fighting on", target.Type, h)
+				continue
+			}
 			return killed, fmt.Errorf("retreated, health %.1f (killed %d)", h, killed)
 		}
 		if target == nil {
@@ -338,12 +352,22 @@ func (r *robot) defend() bool {
 		}
 		// one a defence could not reach (a spider in the cave under the
 		// stairs) and that has not hurt it since: left alone a while
-		if time.Now().Before(r.leftAlone[e.ID]) && !hurt {
+		if r.isLeftAlone(e.ID) && !hurt {
 			continue
 		}
 		// a creeper is not fought but left: one that reaches it blows up
 		// for more than its whole health
 		if e.Type == "minecraft:creeper" {
+			// healthy and armed: hit and back off till it is dead, as a person
+			// with a sword does — fled from, a creeper followed it all day
+			// (seven minutes of walls and runs, the day gone, the night far
+			// from home)
+			if r.player.Status().Health >= 12 && r.holdBestWeapon() == nil {
+				if r.fightCreeper(e.ID) {
+					events.emit("fight", map[string]any{"against": e.Type, "killed": 1})
+					return true
+				}
+			}
 			// close, its fuse lit: a hit first — the knockback throws it out
 			// of its blast's reach and its fuse goes out as the robot gets
 			// away; backing off alone it follows
@@ -359,7 +383,7 @@ func (r *robot) defend() bool {
 				}
 			}
 			log.Printf("robot: a creeper at %.1f %.1f %.1f: away from it", e.X, e.Y, e.Z)
-			r.retreat(e.X, e.Z)
+			r.awayFromCreeper(e)
 			events.emit("fight", map[string]any{"against": e.Type, "killed": 0, "fled": true})
 			return true
 		}
@@ -370,15 +394,17 @@ func (r *robot) defend() bool {
 		if killed == 0 && time.UnixMilli(r.lastHurt.Load()).Before(began) {
 			// none killed, not hurt: the ones about are out of its reach —
 			// a minute on with its work, not another fight with them
+			q := r.player.Position()
+			r.leftMu.Lock()
 			if r.leftAlone == nil {
 				r.leftAlone = map[int32]time.Time{}
 			}
-			q := r.player.Position()
 			for _, m := range r.entities.Nearby(q.X, q.Y, q.Z, 12) {
 				if hostileType(m.Type) {
 					r.leftAlone[m.ID] = time.Now().Add(time.Minute)
 				}
 			}
+			r.leftMu.Unlock()
 		}
 		events.emit("fight", map[string]any{"against": e.Type, "killed": killed})
 		// hungry: what they dropped (a zombie's flesh is food, at a pinch);
@@ -401,10 +427,12 @@ func (r *robot) defend() bool {
 }
 
 // retreat runs some sixteen blocks straight away from (fromX, fromZ), to
-// where the ground is, and eats.
-func (r *robot) retreat(fromX, fromZ float64) {
+// where the ground is, and eats. It reports whether it got away: walled in,
+// or six blocks and more from where it was (not: no ground that way, the run
+// blocked).
+func (r *robot) retreat(fromX, fromZ float64) bool {
 	if r.hiding {
-		return // walling itself in (or walled in): a run would leave the walls half built
+		return true // walling itself in (or walled in): a run would leave the walls half built
 	}
 	if time.Since(r.retreatsSince) > 30*time.Second {
 		r.retreatsSince, r.retreats = time.Now(), 0
@@ -412,9 +440,11 @@ func (r *robot) retreat(fromX, fromZ float64) {
 	r.retreats++
 	if r.wallInFromMob() { // in a tunnel, or chased: blocks between, not a run it follows
 		r.retreats = 0
-		return
+		return true
 	}
 	p := r.player.Position()
+	defer r.eatIfHungry()
+	defer func() { r.walker.Sprint = false }()
 	dx, dz := p.X-fromX, p.Z-fromZ
 	d := math.Hypot(dx, dz)
 	if d < 0.1 {
@@ -439,7 +469,8 @@ func (r *robot) retreat(fromX, fromZ float64) {
 		r.walker.Stop()
 		break
 	}
-	r.eatIfHungry()
+	q := r.player.Position()
+	return math.Hypot(q.X-p.X, q.Z-p.Z) >= 6
 }
 
 // awayFromWarden: a warden within thirty-two blocks is never fought (five
@@ -467,4 +498,120 @@ func (r *robot) awayFromWarden() bool {
 		return true
 	}
 	return false
+}
+
+// isLeftAlone reports whether the mob id is one a defence could not reach,
+// left alone for now (the reflexes read it beside the order's fights).
+func (r *robot) isLeftAlone(id int32) bool {
+	r.leftMu.Lock()
+	defer r.leftMu.Unlock()
+	return time.Now().Before(r.leftAlone[id])
+}
+
+// escapeUp puts two blocks under it, a jump each (pillarUp), out of the
+// reach of the mob kind that strikes it, and waits there, eating, till no
+// hostile is within four blocks (two minutes at most). It reports whether it
+// got up.
+func (r *robot) escapeUp(kind string) bool {
+	if r.ui.Count("minecraft:dirt")+r.ui.Count("minecraft:cobblestone") < 2 {
+		return false
+	}
+	plan("fight: cornered by the %s: up a pillar", kind)
+	for i := 0; i < 2; i++ {
+		if err := r.pillarUp(); err != nil {
+			plan("fight: up a pillar: %v", err)
+			return i > 0
+		}
+	}
+	prev := r.waiting.Swap(true) // waiting up there is no stuck (the watchdog)
+	defer r.waiting.Store(prev)
+	for deadline := time.Now().Add(2 * time.Minute); time.Now().Before(deadline) && r.hostileNear(4); {
+		r.eatIfHungry()
+		if err := r.ctl.WaitTicks(r.ctx, 20); err != nil {
+			break
+		}
+	}
+	return true
+}
+
+// awayFromCreeper runs from the creeper e; where the run gets nowhere (a
+// thicket, a hole) and it is close, it is hit — the knockback throws it back
+// and its fuse goes out, as a person cornered does (it once ran on the spot
+// from a creeper twelve times in three seconds, till it blew).
+func (r *robot) awayFromCreeper(e entities.Entity) {
+	if r.retreat(e.X, e.Z) {
+		return
+	}
+	now, ok := r.entities.Get(e.ID)
+	if !ok {
+		return
+	}
+	p := r.player.Position()
+	if now.DistanceSqr(p.X, p.Y, p.Z) > 4*4 || r.holdBestWeapon() != nil {
+		return
+	}
+	plan("no way away from the creeper: hit it back")
+	where := func() (entities.Entity, bool) { return r.entities.Get(e.ID) }
+	done := make(chan act.Attack, 1)
+	r.hands.Attack(e.ID, where, func(a act.Attack) { done <- a })
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+	}
+}
+
+// fightCreeper hits the creeper id when it comes within reach and backs off
+// a few blocks after each hit: the knockback throws it out of its blast's
+// reach and its fuse goes out; four hits of a stone sword kill it. Twenty
+// seconds at most, and not below 10 health; whether it is dead (gone).
+func (r *robot) fightCreeper(id int32) bool {
+	log.Printf("robot: the creeper %d: hit and back off", id)
+	where := func() (entities.Entity, bool) { return r.entities.Get(id) }
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); {
+		e, ok := r.entities.Get(id)
+		if !ok {
+			return true // dead (or gone)
+		}
+		if r.player.Status().Health < 10 {
+			return false
+		}
+		p := r.player.Position()
+		d := math.Sqrt(e.DistanceSqr(p.X, p.Y, p.Z))
+		switch {
+		case d > 8:
+			return false // it went its way: no chase
+		case d <= 3.2:
+			_ = r.holdBestWeapon()
+			done := make(chan act.Attack, 1)
+			r.hands.Attack(id, where, func(a act.Attack) { done <- a })
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+			}
+			// back off three blocks from it, to firm ground
+			dx, dz := p.X-e.X, p.Z-e.Z
+			if n := math.Hypot(dx, dz); n > 0.1 {
+				dx, dz = dx/n, dz/n
+			} else {
+				dx, dz = 1, 0
+			}
+			if g, ok := r.groundNear(int(math.Floor(p.X+3*dx)), int(math.Floor(p.Z+3*dz)), int(math.Floor(p.Y))); ok {
+				r.walker.Sprint = true
+				r.walker.Goto(g)
+				for t := 0; t < 20 && r.walker.Status() == "walking"; t++ {
+					if err := r.ctl.WaitTicks(r.ctx, 1); err != nil {
+						return false
+					}
+				}
+				r.walker.Sprint = false
+				r.walker.Stop()
+			}
+		default:
+			if err := r.ctl.WaitTicks(r.ctx, 2); err != nil {
+				return false
+			}
+		}
+	}
+	_, alive := r.entities.Get(id)
+	return !alive
 }

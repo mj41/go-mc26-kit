@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mj41/go-mc26-kit/bot/act"
 	"github.com/mj41/go-mc26-kit/bot/world"
@@ -74,7 +75,8 @@ func cmdDescend(r *robot, args []string) (string, error) {
 	found := map[string]int{}
 	turns := 0
 	r.rest(16) // not down into the dark hurt
-	morning, early, failed, backs := r.nightShift(), "", 0, 0
+	morning, early, failed, backs := r.nightShift(false), "", 0, 0
+steps:
 	for step := 0; ; step++ {
 		// the step it stands on — over a cave, at a step's edge, its middle
 		// may be over the void beside it
@@ -136,7 +138,11 @@ func cmdDescend(r *robot, args []string) (string, error) {
 						continue
 					}
 				}
-				return "", fmt.Errorf("every way down from %d %d %d is dangerous", x, y, z)
+				// no safe way further down from here: the mine is dug at this
+				// level, as a person does who meets an underground lake
+				plan("descend: every way down from %d %d %d is dangerous: no further down tonight", x, y, z)
+				early = " (no safe way further down)"
+				break steps
 			}
 			dir = next
 			continue
@@ -144,7 +150,19 @@ func cmdDescend(r *robot, args []string) (string, error) {
 		plan("descend: step %d from %d %d %d toward %v", step, x, y, z, d)
 		danger := false
 		for _, cy := range []int{y + 1, y, y - 1} {
-			if err := r.clear(world.BlockPos{X: fx, Y: cy, Z: fz}); err != nil {
+			err := r.clear(world.BlockPos{X: fx, Y: cy, Z: fz})
+			// a reflex's fight at the dig's safe point took it off its step
+			// (a skeleton fought up the stairs, the block ahead then under
+			// it): back onto the step, the block again
+			if errors.Is(err, errOwnColumn) && r.standCell() != c {
+				plan("descend: step %d: moved off its step: back onto %v", step, c)
+				if gerr := r.goToLevel(c); gerr != nil {
+					return "", fmt.Errorf("step %d: back to its step %v: %w", step, c, gerr)
+				}
+				r.centre()
+				err = r.clear(world.BlockPos{X: fx, Y: cy, Z: fz})
+			}
+			if err != nil {
 				if !errors.Is(err, errDanger) {
 					return "", fmt.Errorf("step %d: %w", step, err)
 				}
@@ -161,7 +179,9 @@ func cmdDescend(r *robot, args []string) (string, error) {
 				dir = next
 				continue
 			}
-			return "", fmt.Errorf("every way down from %d %d %d is dangerous", x, y, z)
+			plan("descend: every way down from %d %d %d is dangerous: no further down tonight", x, y, z)
+			early = " (no safe way further down)"
+			break steps
 		}
 		// nothing to step down onto: a cave below — bridged across, level,
 		// and on five blocks into the rock past it before the stairs go on
@@ -179,15 +199,20 @@ func cmdDescend(r *robot, args []string) (string, error) {
 				dir = next
 				continue
 			}
-			if err := r.bridge(x, y, z, d, 256); err != nil {
-				if errors.Is(err, errDied) {
+			// a short bridge only: across a great cave in the dark its archers
+			// shoot it off (it died 30 blocks out over one)
+			if err := r.bridge(x, y, z, d, 12); err != nil {
+				if errors.Is(err, errDied) || errors.Is(err, errStopped) {
 					return "", err
 				}
 				plan("descend: no bridge from %d %d %d: %v", x, y, z, err)
 				tried[dir] = true
 				next, ok := inward()
 				if turns++; !ok || turns > 8 {
-					return "", fmt.Errorf("a cave under every way down from %d %d %d", x, y, z)
+					// caves too wide to bridge every way: the night's mine here
+					plan("descend: a cave under every way down from %d %d %d: no further down tonight", x, y, z)
+					early = " (no safe way further down)"
+					break steps
 				}
 				dir = next
 				continue
@@ -473,7 +498,7 @@ func hurts(s block.StateID) bool {
 // clear digs the block at pos until it is open — gravel and sand fall into
 // the hole again — with the best tool in the hotbar.
 func (r *robot) clear(pos world.BlockPos) error {
-	if err := r.diedInOrder(); err != nil {
+	if _, err := r.safePoint(); err != nil {
 		return err
 	}
 	// never under itself or over its head: the floor gives way, or what is
@@ -495,6 +520,11 @@ func (r *robot) clear(pos world.BlockPos) error {
 		if len(block.CollisionShape(s)) == 0 && block.FluidOf(s) == nil && !hurts(s) {
 			return nil
 		}
+		// stone with silverfish in it (infested_*): dug, they swarm out and
+		// call the others in the rock — another way, as at lava
+		if name := block.StateList[s].ID(); strings.HasPrefix(name, "minecraft:infested_") {
+			return fmt.Errorf("%w: %s at %v", errDanger, name, pos)
+		}
 		// lava against the block: dug, it pours in — another way
 		if l, ok := r.lavaBeside(pos); ok {
 			return fmt.Errorf("%w: lava at %v behind %v", errDanger, l, pos)
@@ -511,6 +541,12 @@ func (r *robot) clear(pos world.BlockPos) error {
 		// ends the work, it is not done by hand. A block soft enough to
 		// break in a moment by hand (snow: its snowballs want a shovel) is
 		// dug as it is, its drop not needed
+		// a block no pickaxe it has can get (emerald, diamond, gold ore with
+		// stone; obsidian with iron): dug round, as at lava — a new stone
+		// pickaxe would not get it either (descend once failed so)
+		if r.tooHard(s) {
+			return fmt.Errorf("%w: %s at %v wants a better pickaxe", errDanger, world.StateString(s), pos)
+		}
 		if block.RequiresCorrectTool(s) && block.DestroySpeed(s) > 0.5 && !r.diggingOut {
 			if _, correct := act.ToolSpeed(&r.client.Tags, r.heldStack(), s); !correct {
 				// worn out: a new stone pickaxe, made at the table near (the
@@ -584,7 +620,7 @@ func fillBlocks() []string {
 }
 
 func (r *robot) fill(pos world.BlockPos) error {
-	if err := r.diedInOrder(); err != nil {
+	if _, err := r.safePoint(); err != nil {
 		return err
 	}
 	if st, ok := r.world.BlockAt(pos); ok && len(block.CollisionShape(st)) > 0 {
@@ -741,7 +777,18 @@ func (r *robot) bridge(x, y, z int, d [2]int, max int) error {
 	defer func() { r.walker.Sneak, r.onBridge, r.climbing = false, false, climbing }()
 	cx, cz := x, z
 	beyond := -1 // steps since the far side
+	began := time.Now()
 	for i := 0; i < max+5; i++ {
+		// shot at out over the cave: back, another way — not on with an
+		// archer below
+		if time.UnixMilli(r.lastHurt.Load()).After(began) {
+			p := r.player.Position()
+			for _, e := range r.entities.Nearby(p.X, p.Y, p.Z, 16) {
+				if rangedType(e.Type) {
+					return fmt.Errorf("an archer (%s) shoots at the bridge", e.Type)
+				}
+			}
+		}
 		nx, nz := cx+d[0], cz+d[1]
 		for _, cy := range []int{y, y + 1} {
 			if err := r.clear(world.BlockPos{X: nx, Y: cy, Z: nz}); err != nil {
@@ -929,4 +976,26 @@ func (r *robot) floorAhead(pos world.BlockPos) bool {
 		top = math.Max(top, b.MaxY)
 	}
 	return float64(pos.Y)+top <= p.Y+1e-3
+}
+
+// tooHard reports whether the block s wants a pickaxe better than any it
+// carries: needs_diamond_tool with no diamond (or netherite) pickaxe,
+// needs_iron_tool with no iron one or better.
+func (r *robot) tooHard(s block.StateID) bool {
+	id := blockID(s)
+	has := func(items ...string) bool {
+		for _, it := range items {
+			if r.ui.Count(it) > 0 {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case slices.Contains(tagBlocks("minecraft:needs_diamond_tool"), id):
+		return !has("minecraft:diamond_pickaxe", "minecraft:netherite_pickaxe")
+	case slices.Contains(tagBlocks("minecraft:needs_iron_tool"), id):
+		return !has("minecraft:iron_pickaxe", "minecraft:diamond_pickaxe", "minecraft:netherite_pickaxe")
+	}
+	return false
 }

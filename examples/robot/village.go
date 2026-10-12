@@ -124,7 +124,9 @@ func cmdVillage(r *robot, args []string) (string, error) {
 		}
 		r.learn()
 	}
-	return "", fmt.Errorf("%w: no village found in %d legs", errNoWay, legs)
+	// none found: an answer, not a failure — a village may be a thousand
+	// blocks off (a week run once held on day 7 here)
+	return fmt.Sprintf("no village found in %d legs", legs), nil
 }
 
 // cmdTradeAll trades with the villagers about (within 24): each one's offers

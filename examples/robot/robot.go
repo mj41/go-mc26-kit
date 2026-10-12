@@ -99,6 +99,7 @@ import (
 	"github.com/mj41/go-mc26-kit/bot/recipes"
 	"github.com/mj41/go-mc26-kit/bot/ride"
 	"github.com/mj41/go-mc26-kit/bot/screen"
+	"github.com/mj41/go-mc26-kit/bot/ticks"
 	"github.com/mj41/go-mc26-kit/bot/world"
 	"github.com/mj41/go-mc26/chat"
 	"github.com/mj41/go-mc26/data/entity"
@@ -115,6 +116,7 @@ var (
 
 // robot is everything the commands work with.
 type robot struct {
+	ticks                    *ticks.Collector // what each tick brought (ticks.go)
 	client                   *bot.Client
 	player                   *basic.Player
 	world                    *world.World
@@ -129,10 +131,25 @@ type robot struct {
 	ui                       *act.Screens
 	signs                    *act.Signs
 	pickedUp                 atomic.Int32
-	deaths, orderDeaths      atomic.Int32 // deaths so far; and when the running order began
-	splashes                 chan splash  // bobbers' splashes heard (fishing)
+	deaths, orderDeaths      atomic.Int32  // deaths so far; and when the running order began
+	stops, orderStops        atomic.Int32  // stop given so far; and when the running order began
+	ordering                 atomic.Bool   // an order runs (runOrders)
+	stuckStop                atomic.Bool   // the order was stopped by the watchdog: out, then once again
+	inReflex, hideReflex     bool          // a reflex round runs now; and it is the night's (hideIfNight)
+	progress                 atomic.Int64  // digs, placings, crafts done: work standing still is no stuck (the watchdog)
+	liveGo                   chan struct{} // closed by live: the day loop begins (-days)
+	liveOnce                 sync.Once
+	housekeeping             bool       // the day loop housekeeping now (housekeep): not again inside
+	sigMu                    sync.Mutex // the watchers' signals (watch.go)
+	sig                      signals
+	liveDay                  atomic.Int32   // the day it lives (the day loop), kept in its memory
+	toolingUp                bool           // making a tool first (toolsFirst): not another inside
+	lastGoal                 world.BlockPos // where the last walk went (the watchdog's way out)
+	hasGoal                  bool
+	queue                    chan task   // the orders waiting for the runner (tasks.go)
+	gate                     gate        // holds the running order at a safe point while paused
+	splashes                 chan splash // bobbers' splashes heard (fishing)
 	seenMu                   sync.Mutex
-	cmdMu                    sync.Mutex // one command at a time (runOrder)
 	changeMu                 sync.Mutex // the block changes not told yet (changes events)
 	changed                  map[world.BlockPos]block.StateID
 	seen                     map[string]int // the types of the entities added since "seen reset"
@@ -140,35 +157,41 @@ type robot struct {
 	orders                   chan order     // commands players gave in chat (obey)
 	rider                    *ride.Rider
 	clock                    *clock.Clock
-	home                     *room                   // the shelter it dug, nil before
-	deep                     *spot                   // where its stairs got to, the way they go
-	upgraded                 map[string]time.Time    // a better tool last tried (and failed) at
-	climbing                 bool                    // digging its way out (goto: not again inside)
-	search                   searchState             // its search for what is not in sight (explore)
-	legging                  bool                    // walking a far goal in legs (goto: the legs walk plainly)
-	field                    *world.BlockPos         // its wheat field's water (farm), nil before
-	onBridge                 bool                    // crossing a cave on its bridge: shift held, fights where it stands
-	keepOut                  *[2]world.BlockPos      // a box not dug in for what it needs (a plot being levelled), nil for none
-	atlas                    atlas                   // what it has seen round home, simplified (mapmem.go)
-	waiting                  atomic.Bool             // waiting by choice (furnaces at work, hidden): its stillness is no stuck
-	hiding                   bool                    // walled in for the night (hide): not again inside
-	healing                  bool                    // resting to heal (defend): not again inside
-	restedAt                 time.Time               // when it last rested to heal (defend)
-	foodSought               time.Time               // when it last looked for food round it (findFood)
-	bucketWater              *world.BlockPos         // still water seen under ground (no water on the land): buckets for the field
-	avoid                    map[world.BlockPos]bool // cells not to stand on (reach): the field's pool and channel, while dug
-	wild                     *world.BlockPos         // a field round water it found, sown before it had a bucket
-	water                    *world.BlockPos         // still water it found (cmdWater): the buckets' water
-	bounds                   *bounds                 // where the work at hand may take it (inBounds); nil: anywhere
-	retreatsSince            time.Time               // retreats counted since (a mob that keeps up: walled in)
+	home                     *room                                   // the shelter it dug, nil before
+	deep                     *spot                                   // where its stairs got to, the way they go
+	upgraded                 map[string]time.Time                    // a better tool last tried (and failed) at
+	climbing                 bool                                    // digging its way out (goto: not again inside)
+	search                   searchState                             // its search for what is not in sight (explore)
+	legging                  bool                                    // walking a far goal in legs (goto: the legs walk plainly)
+	field                    *world.BlockPos                         // its wheat field's water (farm), nil before
+	onBridge                 bool                                    // crossing a cave on its bridge: shift held, fights where it stands
+	keepOut                  *[2]world.BlockPos                      // a box not dug in for what it needs (a plot being levelled), nil for none
+	atlas                    atlas                                   // what it has seen round home, simplified (mapmem.go)
+	waiting                  atomic.Bool                             // waiting by choice (furnaces at work, hidden): its stillness is no stuck
+	hiding                   bool                                    // walled in for the night (hide): not again inside
+	healing                  bool                                    // resting to heal (defend): not again inside
+	restedAt                 time.Time                               // when it last rested to heal (defend)
+	foodSought               time.Time                               // when it last looked for food round it (findFood)
+	bucketWater              *world.BlockPos                         // still water seen under ground (no water on the land): buckets for the field
+	avoid                    map[world.BlockPos]bool                 // cells not to stand on (reach): the field's pool and channel, while dug
+	avoidSet                 atomic.Pointer[map[world.BlockPos]bool] // what fieldWaterAt answers from: avoid and the field's water, published whole (farm.go publishAvoid)
+	wild                     *world.BlockPos                         // a field round water it found, sown before it had a bucket
+	water                    *world.BlockPos                         // still water it found (cmdWater): the buckets' water
+	bounds                   *bounds                                 // where the work at hand may take it (inBounds); nil: anywhere
+	retreatsSince            time.Time                               // retreats counted since (a mob that keeps up: walled in)
 	retreats                 int
-	putBackSince             time.Time // the server putting it back: since when counted (relog)
+	retooled                 int32                   // the deaths retooled after (retool)
+	badTables                map[world.BlockPos]bool // crafting tables that did not open (craftGoal): others used
+	dangers                  []world.BlockPos        // where it was killed out on the land (seenMu): not scouted again
+	standUntil               time.Time               // a retreat that got nowhere (a tunnel, mobs on both sides): it fights on till then
+	putBackSince             time.Time               // the server putting it back: since when counted (relog)
 	putBack                  int
 	diggingOut               bool      // tunnelToward: stone dug by hand when no pickaxe is left
 	newPick                  bool      // making a new pickaxe (clear): not again within it
 	defending                int       // defend within defend (its own walks): how deep
 	streamFirst, streamQuiet time.Time // the stream reflex: since when counted, quiet till
 	streamN                  int
+	inStream                 bool            // stepping out of a stream now (outOfStream)
 	deathAt                  *world.BlockPos // where it last died, its things lying there (recover)
 	deathTime                time.Time
 	stairs                   []world.BlockPos // its staircase from home down, step by step (where the feet were)
@@ -177,19 +200,22 @@ type robot struct {
 	phases                   []phase // the times of day it has seen, as they came
 	ctx                      context.Context
 	food                     atomic.Int32
-	health                   atomic.Uint32       // float32 bits, the last health the server sent
-	lastHurt                 atomic.Int64        // when it was last hurt, Unix milliseconds
-	leftAlone                map[int32]time.Time // mobs a defence could not reach, till when they are left (defend)
-	wardenAt                 time.Time           // when it last saw a warden (no mine that night)
-	fleeing                  bool                // going away from a warden
+	health                   atomic.Uint32        // float32 bits, the last health the server sent
+	lastHurt                 atomic.Int64         // when it was last hurt, Unix milliseconds
+	leftAlone                map[int32]time.Time  // mobs a defence could not reach, till when they are left (defend)
+	leftMu                   sync.Mutex           // leftAlone, read by the reflexes too
+	reflexMu                 sync.Mutex           // a reflex round with no order running: the runner waits for it
+	reflexNext               map[string]time.Time // a danger's next round no sooner (reflexes)
+	wardenAt                 time.Time            // when it last saw a warden (no mine that night)
+	fleeing                  bool                 // going away from a warden
 }
 
-func main() {
-	flag.Parse()
-	log.SetFlags(log.Ltime | log.Lmicroseconds)
-	r := &robot{client: bot.NewClient(), orders: make(chan order, 4)}
+// newRobot assembles a robot — its client, player, world, entities, walker and controller, wired as one — and
+// leaves it unjoined: main joins it to a server and starts its goroutines, a test to a game of simworld.
+func newRobot(name string) *robot {
+	r := &robot{client: bot.NewClient(), orders: make(chan order, 4), queue: make(chan task, queueLen), liveGo: make(chan struct{})}
 	serverTags = &r.client.Tags // logs, ores, crops: as the server's data pack has them (data.go)
-	r.client.Auth = bot.Auth{Name: *name}
+	r.client.Auth = bot.Auth{Name: name}
 	r.food.Store(20)
 	r.health.Store(math.Float32bits(20))
 	r.player = basic.NewPlayer(r.client, basic.DefaultSettings, basic.EventsListener{
@@ -235,6 +261,11 @@ func main() {
 			r.seenMu.Lock()
 			r.deathAt = &world.BlockPos{X: int(math.Floor(p.X)), Y: int(math.Floor(p.Y + 1e-6)), Z: int(math.Floor(p.Z))}
 			r.deathTime = time.Now()
+			// killed out on the land: a place of mobs (a dark wood, mobs by
+			// day), not scouted again
+			if r.underSky() && len(r.dangers) < 16 {
+				r.dangers = append(r.dangers, *r.deathAt)
+			}
 			r.seenMu.Unlock()
 			events.emit("died", map[string]any{"x": round2(p.X), "y": round2(p.Y), "z": round2(p.Z)})
 			// a person looks at the death screen for a moment, then clicks respawn
@@ -276,9 +307,12 @@ func main() {
 			}
 		},
 	})
+	r.ticks = ticks.New(r.client, r.entities) // what each tick brought, for the tick event (ticks.go)
 	r.clock = clock.New(r.client)
 	r.splashes = make(chan splash, 8)
 	r.client.Events.AddListener(r.soundListener())
+	r.client.Events.AddListener(r.blockEventListener()) // a chest's lid… for a watcher (screens.go)
+	r.client.Events.AddListener(r.brokeListener())      // a tool broken in a hand, as the server says (broke.go)
 	// its advancements, as the game shows them: one done is an event (its
 	// badge), those done before it joined too, said so
 	advancements.New(r.client, func(a advancements.Advancement, initial bool) {
@@ -304,6 +338,7 @@ func main() {
 	r.ctl.Think = r.walker.Think
 	r.hands = &act.Hands{C: r.client, World: r.world, Screens: r.screens}
 	r.ctl.Act = r.hands.Act
+	r.ctl.Ticked = r.tickEvent // the tick event: what this tick brought (ticks.go)
 	r.book = recipes.New(r.client)
 	r.ui = &act.Screens{C: r.client, Ctl: r.ctl, Screens: r.screens, Book: r.book}
 	r.signs = act.NewSigns(r.client)
@@ -315,7 +350,13 @@ func main() {
 			log.Printf("trace pos=%.4f,%.4f,%.4f vel=%.4f,%.4f,%.4f ground=%v crouch=%v fall=%.3f water=%v", p.Pos.X, p.Pos.Y, p.Pos.Z, p.Vel.X, p.Vel.Y, p.Vel.Z, p.OnGround, p.Crouching, p.FallDistance, p.InWater)
 		}
 	}
+	return r
+}
 
+func main() {
+	flag.Parse()
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	r := newRobot(*name)
 	if err := r.client.JoinServer(*address); err != nil {
 		log.Fatal(err)
 	}
@@ -344,6 +385,12 @@ func main() {
 		}
 		go r.keepMemory(*memoryAt)
 	}
+	go r.runOrders()
+	go r.reflexes()
+	go r.watchdog()
+	go r.dayLoop()
+	go r.watchSurroundings()
+	go r.watchInventory()
 	go r.obey()
 	go r.report()
 	go r.reportChanges()

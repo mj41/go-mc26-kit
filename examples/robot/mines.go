@@ -54,8 +54,22 @@ func (r *robot) facing() [2]int {
 func rightOf(d [2]int) [2]int { return [2]int{-d[1], d[0]} }
 
 // cmdMine lays out a mine where the robot stands (see above): mine [main]
-// [branch]. It answers what ores it got.
+// [branch]. It answers what ores it got. Its pickaxe gone and none to be made
+// down there (no wood for a table): the night's mine ends, up home, as a
+// person goes up for wood — not a mine left failed at the rock.
 func cmdMine(r *robot, args []string) (string, error) {
+	ans, err := mineHere(r, args)
+	if errors.Is(err, errNoTool) {
+		plan("mine: %v: up home", err)
+		if _, ierr := cmdIn(r, nil); ierr != nil {
+			plan("in: %v", ierr)
+		}
+		return "staying in: no pickaxe (it wore out in the mine)", nil
+	}
+	return ans, err
+}
+
+func mineHere(r *robot, args []string) (string, error) {
 	if why := r.unfitForMine(); why != "" {
 		if r.home != nil && r.distanceTo(r.home.centre()) > 4 { // not home (down already, or out): in
 			if _, err := cmdIn(r, nil); err != nil {
@@ -105,7 +119,7 @@ func cmdMine(r *robot, args []string) (string, error) {
 	}
 	plan("mine: at %v going %v", m.o, m.d)
 	r.rest(16)
-	morning := r.nightShift()
+	morning := r.nightShift(true)
 	// the room: four lanes along the stairs, to the right, back and forth
 	room := func() error {
 		for s := 1; s <= 4; s++ {
@@ -247,6 +261,25 @@ func (r *robot) goToLevel(p world.BlockPos) error {
 	y := int(math.Floor(r.player.Position().Y + 1e-6))
 	if y >= p.Y {
 		return err
+	}
+	// a step or two under it, close by (a hole in its own stairs, a drop
+	// beside it): up on a block or two of what it carries, as a person
+	// climbs back — then the step is a step again
+	if q := r.player.Position(); p.Y-y <= 3 && math.Hypot(float64(p.X)+0.5-q.X, float64(p.Z)+0.5-q.Z) <= 2 {
+		plan("mine: %d under %v, close: up on blocks", p.Y-y, p)
+		for i := y; i < p.Y; i++ {
+			if perr := r.pillarUp(); perr != nil {
+				plan("mine: up on blocks: %v", perr)
+				break
+			}
+		}
+		if gerr := r.goTo(p); gerr == nil {
+			return nil
+		}
+		y = int(math.Floor(r.player.Position().Y + 1e-6))
+		if y >= p.Y {
+			return err
+		}
 	}
 	plan("mine: below the level (%d, the mine %d): stairs up to it", y, p.Y)
 	if cerr := r.climbOut(p); cerr != nil {

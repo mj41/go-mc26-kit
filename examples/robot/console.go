@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,6 +73,9 @@ var commands = map[string]command{
 	"usetoward": cmdUseToward,
 	"dismount":  cmdDismount,
 	"stop":      cmdStop,
+	"tidy":      cmdTidy,
+	"live":      cmdLive,
+	"upgrade":   cmdUpgrade,
 	"dig":       cmdDig,
 	"collect":   cmdCollect,
 	"place":     cmdPlace,
@@ -123,12 +127,16 @@ func (r *robot) console(in io.Reader, stop func()) {
 			log.Printf("robot: error unknown command %q", words[0])
 			continue
 		}
-		answer, err := runOrder(r, cmd, words)
-		if err != nil {
-			log.Printf("robot: error %s: %v", words[0], err)
-			continue
-		}
-		log.Printf("robot: %s %s", words[0], answer)
+		// queued (a look at once): the next line read while it runs — a stop,
+		// a look — and its answer logged when it is done
+		name := words[0]
+		r.order(words, source{kind: "console"}, cmd, func(answer string, err error) {
+			if err != nil {
+				log.Printf("robot: error %s: %v", name, err)
+				return
+			}
+			log.Printf("robot: %s %s", name, answer)
+		}, true)
 	}
 }
 
@@ -385,6 +393,9 @@ func cmdSeen(r *robot, args []string) (string, error) {
 
 func cmdGoto(r *robot, args []string) (string, error) {
 	goal, err := blockPos(args)
+	if err == nil {
+		r.noteGoal(goal)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -417,6 +428,16 @@ func cmdGoto(r *robot, args []string) (string, error) {
 		for t := 0; r.walker.Status() == "walking" && time.Now().Before(deadline); t++ {
 			if err := r.ctl.WaitTicks(r.ctx, 5); err != nil {
 				return "", err
+			}
+			// a safe point: held while paused (then on toward the goal: what
+			// the pause did moved it), ended when stopped or dead
+			if held, err := r.safePoint(); err != nil {
+				r.walker.Stop()
+				return "", err
+			} else if held {
+				r.walker.Goto(goal)
+				deadline = time.Now().Add(2 * time.Minute)
+				continue
 			}
 			if p := r.player.Position(); r.ctl.State().OnGround {
 				if n, ok := r.walker.Graph.Start(p.X, p.Y, p.Z); ok && r.walker.Graph.OnTree(n) {
@@ -501,14 +522,23 @@ func cmdFollow(r *robot, args []string) (string, error) {
 	return args[0], nil
 }
 
+// cmdStop stops the walk, and ends the order running at its next safe point.
 func cmdStop(r *robot, _ []string) (string, error) {
+	r.stops.Add(1)
 	r.walker.Stop()
+	r.gate.resume() // held at a safe point: on to it, where it ends
 	return "stopped", nil
 }
 
 func cmdDig(r *robot, args []string) (string, error) {
 	pos, err := blockPos(args)
 	if err != nil {
+		return "", err
+	}
+	// a safe point before each dig: a reflex round gets in between two digs
+	// (a tree felled log by log had none: a zombie killed it mid-felling,
+	// every pause timed out), and a stop or a death ends the order here
+	if _, err := r.safePoint(); err != nil {
 		return "", err
 	}
 	// water and lava themselves are not dug (a minute's swinging at a pond
@@ -533,8 +563,15 @@ func cmdDig(r *robot, args []string) (string, error) {
 		select {
 		case d := <-result:
 			if d.Err != nil {
+				// gone before the dig began (a leaf decayed, a block fallen,
+				// dug by the round before): what it was to do is done — the
+				// shelter once failed whole on one such block
+				if strings.Contains(d.Err.Error(), "nothing to dig") {
+					return "already empty", nil
+				}
 				return "", d.Err
 			}
+			r.progress.Add(1) // a block dug: work, not stuck (the watchdog)
 			return fmt.Sprintf("ticks=%d was=%s airborne=%d", d.Ticks, world.StateString(d.Was), d.Airborne), nil
 		case <-tick.C:
 			// hit while digging (a long dig: stone by hand): the dig given
@@ -636,8 +673,12 @@ func cmdCollect(r *robot, args []string) (string, error) {
 					break
 				}
 			}
-			// the server hands it over within a few ticks of being close
-			for t := 0; t < 20; t++ {
+			// the server hands it over within a few ticks of being close — unless the walk ended with no way
+			// (every place reachable searched) and the item is out of reach: nothing will hand it over, the
+			// wait would only be waited
+			pos := r.player.Position()
+			np, noWay := r.walker.NoPath()
+			for t := 0; t < 20 && !handoverHopeless(noWay && !np.Limit, target.X-pos.X, target.Y-pos.Y, target.Z-pos.Z); t++ {
 				if _, still := r.entities.Get(target.ID); !still {
 					break
 				}
@@ -688,12 +729,25 @@ func cmdCollect(r *robot, args []string) (string, error) {
 	return strconv.Itoa(int(r.pickedUp.Load() - before)), nil
 }
 
+// pickupReach is how far from the player an item lies and is still handed over: the player's box grown by a
+// block along x and z and half a block along y (the item's own box counted), with a little over.
+const pickupReach, pickupReachY = 1.5, 1.0
+
+// handoverHopeless is whether waiting for the server to hand an item over is pointless: the path search found no
+// way to it (every place reachable searched) and it lies out of the pickup's reach (dx, dy, dz from the player).
+func handoverHopeless(noWay bool, dx, dy, dz float64) bool {
+	return noWay && (math.Hypot(dx, dz) > pickupReach || math.Abs(dy) > pickupReachY)
+}
+
 // waitUse waits for a hands action that reports an act.Use.
 func waitUse(r *robot, start func(func(act.Use))) (act.Use, error) {
 	result := make(chan act.Use, 1)
 	start(func(u act.Use) { result <- u })
 	select {
 	case u := <-result:
+		if u.Err == nil {
+			r.progress.Add(1) // placed, used: work, not stuck (the watchdog)
+		}
 		return u, u.Err
 	case <-time.After(time.Minute):
 		return act.Use{}, fmt.Errorf("no result after a minute")
@@ -803,6 +857,7 @@ func cmdOpen(r *robot, args []string) (string, error) {
 				return err
 			}
 		}
+		noteOpened(pos) // the block a screen opened now comes from (screens.go)
 		_, err := waitUse(r, func(done func(act.Use)) { r.hands.Interact(pos, done) })
 		return err
 	}
@@ -852,6 +907,7 @@ func cmdCraft(r *robot, args []string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("made %d: %w", made, err)
 	}
+	r.progress.Add(1)
 	return strconv.Itoa(made), nil
 }
 
@@ -881,7 +937,7 @@ func cmdSmelt(r *robot, args []string) (string, error) {
 		}
 		n = v
 	}
-	got, err := r.ui.Smelt(r.ctx, fullName(args[0]), fullName(args[1]), n)
+	got, err := r.smeltWaiting(fullName(args[0]), fullName(args[1]), n)
 	if err != nil {
 		return "", err
 	}
@@ -1151,6 +1207,11 @@ func (r *robot) climbOut(goal world.BlockPos) error { return r.climbOutWithin(go
 // none (0: any way): fallen down a cliff, the way round through the caves is
 // no way back up.
 func (r *robot) climbOutWithin(goal world.BlockPos, maxLen int) error {
+	// up in the leaves (a walk over trees took it there, the ground far
+	// under): down through them first, as a person climbs out of a canopy
+	if r.downThroughLeaves(goal) {
+		return nil
+	}
 	g := r.walker.Graph
 	short := func(nodes []path.Node) bool { return maxLen <= 0 || len(nodes) <= maxLen }
 	for round := 0; round < 4; round++ {
@@ -1203,6 +1264,16 @@ func (r *robot) climbOutWithin(goal world.BlockPos, maxLen int) error {
 			if abs(dz) > abs(dx) {
 				ways[0], ways[1] = ways[1], ways[0]
 			}
+			// down to a lower goal: the ways toward it first, then the others —
+			// on a ledge over a cliff the stairs go down into the rock behind
+			// it, as a person digs down where they cannot step down
+			if goal.Y < y-1 {
+				for _, d := range [][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
+					if d != ways[0] && d != ways[1] {
+						ways = append(ways, d)
+					}
+				}
+			}
 			if abs(dx) <= 1 && abs(dz) <= 1 && abs(goal.Y-y) > 1 {
 				// right under it (or over it): a spiral round a small column,
 				// a quarter turn each step (toward it would step away and back)
@@ -1254,6 +1325,11 @@ func (r *robot) climbOutWithin(goal world.BlockPos, maxLen int) error {
 				// a step up on blocks is a stair; a step down over the air
 				// on the land would be a bridge: not that way
 				if ok && r.openAt(floor) && ny < y && r.openSky(world.BlockPos{X: fx, Y: ny, Z: fz}) {
+					// a bridge down the air is not built; a drop is the last way, toward a goal under it
+					if r.dropOff(d, goal) {
+						moved = true
+						break
+					}
 					plan("climb out: the open air below %v: not that way", floor)
 					continue
 				}
@@ -1535,4 +1611,113 @@ func (r *robot) underRoof() bool {
 		}
 	}
 	return false
+}
+
+// ownPillar reports whether the block at pos (s) is a pillar's, as the robot
+// builds one to reach the high logs of a tree — dirt or cobblestone standing
+// alone, open on its four sides — or a lone trunk's log, the same.
+func (r *robot) ownPillar(pos world.BlockPos, s block.StateID) bool {
+	// its own pillar's dirt or stone, or a tree's trunk left standing alone
+	// (a felling done round it — it once stood stranded on one, 15 up)
+	switch id := blockID(s); {
+	case id == "minecraft:dirt", id == "minecraft:cobblestone", id == "minecraft:cobbled_deepslate":
+	case slices.Contains(logItems(), id):
+	default:
+		return false
+	}
+	for _, d := range [][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
+		if !r.openAt(world.BlockPos{X: pos.X + d[0], Y: pos.Y, Z: pos.Z + d[1]}) {
+			return false
+		}
+	}
+	return true
+}
+
+// downThroughLeaves breaks the leaves (or its own pillar) under the robot, one at a time, while
+// goal is lower than it and there is something to land on within four
+// blocks under each (no fall that hurts): stranded up in a canopy — every
+// place it can walk to more leaves, the ground a long drop — a person breaks
+// the leaves under their feet and climbs down. It reports whether it got
+// lower.
+func (r *robot) downThroughLeaves(goal world.BlockPos) bool {
+	lower := false
+	// shut in up there — a few leaves left of a felled canopy, the rest
+	// decayed under it: down whatever the goal's height (it once stood on a
+	// last leaf seven over the ground for three minutes, the logs of the next
+	// tree level with it)
+	shutIn := r.shutIn(goal)
+	for i := 0; i < 24; i++ {
+		p := r.player.Position()
+		feet := world.BlockPos{X: int(math.Floor(p.X)), Y: int(math.Floor(p.Y + 1e-6)), Z: int(math.Floor(p.Z))}
+		if goal.Y >= feet.Y-1 && !shutIn {
+			break
+		}
+		under := world.BlockPos{X: feet.X, Y: feet.Y - 1, Z: feet.Z}
+		// never its own shelter's shell (a leaf of its roof is no canopy)
+		if r.home != nil && math.Abs(float64(under.X-r.home.centre().X))+math.Abs(float64(under.Z-r.home.centre().Z)) <= 4 && math.Abs(float64(under.Y-r.home.centre().Y)) <= 3 {
+			break
+		}
+		s, ok := r.world.BlockAt(under)
+		if !ok || !strings.HasSuffix(blockID(s), "_leaves") && !r.ownPillar(under, s) {
+			break
+		}
+		// something to land on: near (four under, no fall that hurts), or
+		// further when the fall's hurt leaves it six health to spare — the
+		// last leaf of a felled canopy, eight up over the ground, is dropped
+		// from, as a person does
+		landing := false
+		for dy := 2; dy <= 16; dy++ {
+			if b, ok := r.world.BlockAt(world.BlockPos{X: feet.X, Y: feet.Y - dy, Z: feet.Z}); ok && len(block.CollisionShape(b)) > 0 {
+				fall := float32(dy - 1 - 3) // the hurt of a fall: its blocks less three
+				landing = dy <= 5 || r.player.Status().Health > fall+6
+				break
+			}
+		}
+		if !landing {
+			break
+		}
+		if i == 0 {
+			plan("up in the leaves (or on a pillar) at %v: down through them", feet)
+		}
+		if _, err := cmdDig(r, []string{strconv.Itoa(under.X), strconv.Itoa(under.Y), strconv.Itoa(under.Z)}); err != nil {
+			plan("down through the leaves: %v", err)
+			break
+		}
+		for t := 0; t < 40; t++ {
+			if err := r.ctl.WaitTicks(r.ctx, 1); err != nil {
+				return lower
+			}
+			if r.ctl.State().OnGround && r.player.Position().Y < float64(feet.Y)-0.5 {
+				break
+			}
+		}
+		lower = lower || r.player.Position().Y < float64(feet.Y)-0.5
+	}
+	return lower
+}
+
+// shutIn: no way toward goal, and the places it can walk to are a handful
+// (a canopy's last leaves, a pillar's top) — not a hillside or a cave.
+func (r *robot) shutIn(goal world.BlockPos) bool {
+	p := r.player.Position()
+	start, ok := r.walker.Graph.Start(p.X, p.Y, p.Z)
+	if !ok {
+		return false
+	}
+	_, err := r.walker.Graph.Find(start, goal, 2000)
+	var np *path.NoPathError
+	return errors.As(err, &np) && !np.Limit && np.Searched <= 64
+}
+
+// cmdTidy keeps room in the pack (tidy): the rubble into a chest near.
+func cmdTidy(r *robot, _ []string) (string, error) {
+	before := r.freeSlots()
+	r.tidy()
+	return fmt.Sprintf("slots free %d, was %d", r.freeSlots(), before), nil
+}
+
+// cmdUpgrade makes the best tools it can of what it carries (upgrade).
+func cmdUpgrade(r *robot, _ []string) (string, error) {
+	r.upgrade()
+	return fmt.Sprintf("pickaxes %d, swords %d", r.countAll(tagItems("minecraft:pickaxes")), r.countAll(tagItems("minecraft:swords"))), nil
 }

@@ -5,6 +5,7 @@ import (
 	"github.com/mj41/go-mc26-kit/bot/basic"
 	"log"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/mj41/go-mc26-kit/bot/world"
@@ -20,6 +21,11 @@ import (
 // as a person does who walked into a stream: it pushes, and drowns. It
 // reports whether it was in one.
 func (r *robot) outOfStream() bool {
+	// not again from the walk out (a walk defends itself, and that steps
+	// out of the stream): one way out at a time
+	if r.inStream {
+		return false
+	}
 	p := r.player.Position()
 	x, y, z := int(math.Floor(p.X)), int(math.Floor(p.Y+1e-6)), int(math.Floor(p.Z))
 	moving := func(pos world.BlockPos) bool {
@@ -62,6 +68,11 @@ func (r *robot) outOfStream() bool {
 	if !r.underSky() && !r.skyWithin(8) {
 		defer r.sealWater(stream)
 	}
+	r.inStream = true
+	defer func() { r.inStream = false }()
+	// the nearest three places to stand on: a walk each, not every place
+	// round it (in moving water a walk may fail many times, a minute each)
+	tries := 0
 	for d := 1; d <= 4; d++ {
 		for dx := -d; dx <= d; dx++ {
 			for dz := -d; dz <= d; dz++ {
@@ -72,6 +83,9 @@ func (r *robot) outOfStream() bool {
 					}
 					plan("in a stream at %d %d %d: out to %v", x, y, z, c)
 					if err := r.walkTo(c); err == nil {
+						return true
+					}
+					if tries++; tries == 3 {
 						return true
 					}
 				}
@@ -121,6 +135,18 @@ func (r *robot) wallInFromMob() bool {
 		if rangedType(e.Type) {
 			archer = true
 		}
+		// one at arm's reach that strikes, not shoots: fought first — walls
+		// take seconds to put up, it strikes all the while (a zombie beside it
+		// killed it while it walled itself in from a skeleton, on open ground
+		// where the walls would not stand)
+		if hostileType(e.Type) && !rangedType(e.Type) && e.Type != "minecraft:creeper" && e.DistanceSqr(p.X, p.Y, p.Z) <= 9 {
+			return false
+		}
+		// a creeper coming: walls take seconds, its fuse a second and a half
+		// — away from it, not walled in where it blows
+		if e.Type == "minecraft:creeper" && e.DistanceSqr(p.X, p.Y, p.Z) <= 64 {
+			return false
+		}
 	}
 	// run from again and again (it keeps up): blocks between, anywhere
 	chased := time.Since(r.retreatsSince) < 30*time.Second && r.retreats >= 3
@@ -166,7 +192,10 @@ const hideFar = 48
 // hideIfNight hides it, from whatever it is doing, at night under the sky
 // far from home; the work goes on in the morning. It reports whether it hid.
 func (r *robot) hideIfNight() bool {
-	if r.hiding || !r.underSky() {
+	// not inside a reflex round (but the night's own): walling in gathers
+	// blocks, walks the caves — minutes the reflexes cannot answer another
+	// danger in (it drowned in a lake so, the round that walled it in its own)
+	if r.hiding || !r.underSky() || r.inReflex && !r.hideReflex {
 		return false
 	}
 	if t, ok := r.clock.TimeOfDay(); !ok || t < 12000 || t >= 23000 { // dusk and night
@@ -191,6 +220,14 @@ func (r *robot) hideIfNight() bool {
 // feet and head and over its head — waits for the day, and opens the side
 // toward home (any side, without one).
 func cmdHide(r *robot, _ []string) (string, error) {
+	// up on leaves (a canopy, a felled tree's): down off them first — they
+	// decay under its night's walls (it once walled itself in on the leaves
+	// of a tree it had felled, and fell fifteen blocks at dawn)
+	p := r.player.Position()
+	feet := world.BlockPos{X: int(math.Floor(p.X)), Y: int(math.Floor(p.Y + 1e-6)), Z: int(math.Floor(p.Z))}
+	if s, ok := r.world.BlockAt(world.BlockPos{X: feet.X, Y: feet.Y - 1, Z: feet.Z}); ok && strings.HasSuffix(blockID(s), "_leaves") {
+		r.downThroughLeaves(world.BlockPos{X: feet.X, Y: feet.Y - 32, Z: feet.Z})
+	}
 	return r.wallInUntil(true, "till morning", func() bool { return !r.night() })
 }
 
@@ -255,9 +292,17 @@ func (r *robot) wallInUntil(fetch bool, why string, done func() bool) (string, e
 		r.walker.Stop()
 		spot()
 	}
+	failed := 0
 	for _, w := range walls {
 		if err := r.fill(w); err != nil {
 			plan("hide: wall at %v: %v", w, err)
+			// a mob at it, the walls not standing (the mobs in their cells,
+			// nothing to place against): not a wall more, stood still as it
+			// is hit — away or a fight (four failed walls, a skeleton, a
+			// spider and a creeper at it, killed it)
+			if failed++; !fetch && failed >= 2 {
+				return "", fmt.Errorf("the walls do not stand at %d %d %d (%d failed)", x, y, z, failed)
+			}
 		}
 	}
 	// walled in, it looks ahead, level, as a person waits (the roof put

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -53,30 +52,40 @@ func (r *robot) obey() {
 		if (words[0] == "follow" || words[0] == "come") && len(words) == 1 {
 			words = append(words, o.from)
 		}
-		var reply string
-		if cmd, ok := commands[words[0]]; !ok {
-			reply = fmt.Sprintf("I do not know %q", words[0])
-		} else if answer, err := runOrder(r, cmd, words); err != nil {
-			reply = "error: " + err.Error()
-		} else {
-			reply = answer
-		}
-		if reply == "" {
-			reply = "done"
-		}
-		if len(reply) > 200 {
-			reply = reply[:200] + "…"
-		}
-		log.Printf("robot: order from %s %q: %s", o.from, o.line, reply)
-		var err error
+		src := source{kind: "chat", who: o.from}
 		if o.whisper {
-			err = r.chat.SendCommand("msg " + o.from + " " + reply)
-		} else {
-			err = r.chat.SendMessage(reply)
+			src.kind = "whisper"
 		}
-		if err != nil {
-			log.Printf("robot: answering %s: %v", o.from, err)
+		// the answer the way the order was given, once it is done
+		answer := func(reply string) {
+			if reply == "" {
+				reply = "done"
+			}
+			if len(reply) > 200 {
+				reply = reply[:200] + "…"
+			}
+			log.Printf("robot: order from %s %q: %s", o.from, o.line, reply)
+			var err error
+			if o.whisper {
+				err = r.chat.SendCommand("msg " + o.from + " " + reply)
+			} else {
+				err = r.chat.SendMessage(reply)
+			}
+			if err != nil {
+				log.Printf("robot: answering %s: %v", o.from, err)
+			}
 		}
+		cmd, ok := commands[words[0]]
+		if !ok {
+			answer(fmt.Sprintf("I do not know %q", words[0]))
+			continue
+		}
+		r.order(words, src, cmd, func(a string, err error) {
+			if err != nil {
+				a = "error: " + err.Error()
+			}
+			answer(a)
+		}, false)
 	}
 }
 
@@ -114,44 +123,4 @@ func cmdCome(r *robot, args []string) (string, error) {
 	}
 	goal := world.BlockPos{X: int(math.Floor(e.X)), Y: int(math.Floor(e.Y + 1e-6)), Z: int(math.Floor(e.Z))}
 	return cmdGoto(r, []string{fmt.Sprint(goal.X), fmt.Sprint(goal.Y), fmt.Sprint(goal.Z)})
-}
-
-// concurrentOK are the commands that run beside another: they only look,
-// or stop the one running.
-var concurrentOK = map[string]bool{
-	"pos": true, "state": true, "status": true, "inv": true, "time": true, "seen": true,
-	"nearby": true, "entities": true, "around": true, "light": true, "block": true, "stop": true,
-}
-
-// errDied ends an order the robot died in: it respawned with nothing, far
-// from its work — what it was doing does not go on from there (a person
-// starts again: recover, home).
-var errDied = errors.New("died")
-
-// diedInOrder is errDied once the robot died since the running order began.
-func (r *robot) diedInOrder() error {
-	if r.deaths.Load() != r.orderDeaths.Load() {
-		p := r.player.Position()
-		return fmt.Errorf("%w during the order (respawned at %.0f %.0f %.0f)", errDied, p.X, p.Y, p.Z)
-	}
-	return nil
-}
-
-// runOrder runs a command a player gave, noted in the events.
-func runOrder(r *robot, cmd func(*robot, []string) (string, error), words []string) (string, error) {
-	// one command at a time, from the console or a player's chat: two would
-	// drive the walker and the hands at once. A look at it (pos, state…) and
-	// stop go on beside the one running.
-	if !concurrentOK[words[0]] {
-		r.cmdMu.Lock()
-		defer r.cmdMu.Unlock()
-		r.orderDeaths.Store(r.deaths.Load())
-	}
-	done := r.running(strings.Join(words, " "))
-	answer, err := cmd(r, words[1:])
-	if errors.Is(err, errLate) { // stopped for the dark on purpose: home (or walled in), not a failure
-		answer, err = "stopped: "+err.Error(), nil
-	}
-	done(answer, err)
-	return answer, err
 }

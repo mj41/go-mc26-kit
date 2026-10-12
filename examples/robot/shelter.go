@@ -247,6 +247,7 @@ func (r *robot) digRoom(m room) error {
 		return fmt.Errorf("to the room's middle: %w", err)
 	}
 	r.lightRoom(m)
+	r.sealShell(m)
 	// the way in shut: nothing follows it in
 	for _, dy := range []int{0, 1} {
 		if err := r.fill(m.cell(1, 0, dy)); err != nil {
@@ -650,6 +651,9 @@ func cmdIn(r *robot, _ []string) (string, error) {
 		return "", errors.New("no shelter")
 	}
 	r.eatIfHungry() // a long way up on an empty stomach heals nothing
+	// up in the leaves or on its own pillar (felling round a plot): down
+	// first — no walk home starts from there (the week held so, twice)
+	r.downThroughLeaves(m.centre())
 	// from down its stairs: up them, step by step, the way it came
 	if len(r.stairs) > 0 && r.player.Position().Y < float64(m.y)-3 && r.nearStairs(24) { // down its mine, not out on low ground
 		if err := r.alongStairs(0); err != nil {
@@ -663,6 +667,14 @@ func cmdIn(r *robot, _ []string) (string, error) {
 	// inside it, the robot still stands half in the way, and the server
 	// puts no block inside a player
 	c := m.centre()
+	// far, under rock and away from its stairs (a cave it came to on the way
+	// back to where it died): up to the sky first, then home over the land —
+	// no path search finds a way home through the caves from that far
+	if r.distanceTo(c) > 48 && !r.legging && !r.underSky() && !r.skyWithin(8) && !r.nearStairs(24) {
+		if err := r.upToSky(); err != nil {
+			plan("in: up to the sky: %v", err)
+		}
+	}
 	if r.distanceTo(c) > 48 && !r.legging { // far (back from where it died): in legs, over the land
 		if err := r.legsToward(c); err != nil {
 			plan("in: %v", err)
@@ -762,4 +774,86 @@ func cmdIn(r *robot, _ []string) (string, error) {
 	r.lightRoom(*m)
 	r.storeValuables() // banked: a death outside loses little
 	return fmt.Sprintf("in at %d %d %d", c.X, c.Y, c.Z), nil
+}
+
+// fromChest takes the kinds out of the chest near (within four, the room's):
+// back into the pack what it stashed. It reports how many it took.
+func (r *robot) fromChest(kinds ...string) int {
+	pos, ok := r.nearest([]string{"minecraft:chest"}, nil)
+	if !ok || r.distanceTo(pos) > 6 {
+		return 0
+	}
+	if err := r.reach(pos); err != nil {
+		return 0
+	}
+	if _, err := cmdOpen(r, []string{strconv.Itoa(pos.X), strconv.Itoa(pos.Y), strconv.Itoa(pos.Z)}); err != nil {
+		plan("from the chest: open: %v", err)
+		return 0
+	}
+	took := 0
+	for _, k := range kinds {
+		n, err := r.ui.Move(r.ctx, k, false)
+		if err == nil {
+			took += n
+		}
+	}
+	if m, ok := r.screens.Open(); ok {
+		_ = r.screens.Close(m.ID)
+	}
+	if took > 0 {
+		plan("from the chest at %v: %d things", pos, took)
+	}
+	return took
+}
+
+// sealShell closes the room's shell — its walls, roof and floor, the way
+// in's sides and the tunnel's — where the hill left it open or made of
+// leaves: a leaf decays (and is broken by its own climb down from the hill
+// over it: a survival shelter once had a hole in its roof so); each such
+// cell taken out and filled with what it carries.
+func (r *robot) sealShell(m room) {
+	var shell []world.BlockPos
+	add := func(along, side, dy int) { shell = append(shell, m.cell(along, side, dy)) }
+	for along := 2; along <= 4; along++ {
+		for dy := 0; dy <= 1; dy++ {
+			add(along, -2, dy)
+			add(along, 2, dy)
+		}
+		for side := -1; side <= 1; side++ {
+			add(along, side, 2)
+			add(along, side, -1)
+		}
+	}
+	for _, along := range []int{1, 5, 6, 7} {
+		for dy := 0; dy <= 1; dy++ {
+			add(along, -1, dy)
+			add(along, 1, dy)
+		}
+		add(along, 0, 2)
+		add(along, 0, -1)
+	}
+	sealed := 0
+	for _, c := range shell {
+		s, ok := r.world.BlockAt(c)
+		if !ok {
+			continue
+		}
+		leaf := strings.HasSuffix(blockID(s), "_leaves")
+		if !leaf && !r.openAt(c) {
+			continue
+		}
+		if leaf {
+			if err := r.clear(c); err != nil {
+				continue
+			}
+		}
+		if err := r.fill(c); err != nil {
+			plan("shelter: seal %v: %v", c, err)
+			continue
+		}
+		sealed++
+	}
+	if sealed > 0 {
+		plan("shelter: %d cells of its shell sealed (open or leaves)", sealed)
+	}
 }

@@ -18,9 +18,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mj41/go-mc26-kit/bot"
 	"github.com/mj41/go-mc26-kit/bot/clock"
 	"github.com/mj41/go-mc26-kit/bot/world"
 	"github.com/mj41/go-mc26/data/entity"
+	"github.com/mj41/go-mc26/data/packetid"
 	"github.com/mj41/go-mc26/level/block"
 )
 
@@ -80,7 +82,7 @@ func openEvents(path, source string) (*eventLog, error) {
 }
 
 // telemetry are the names that are measurements, not happenings.
-var telemetry = map[string]bool{"state": true, "view": true, "blocks": true}
+var telemetry = map[string]bool{"state": true, "view": true, "blocks": true, "screen": true, "tick": true}
 
 // emit appends an event named name with data.
 func (l *eventLog) emit(name string, data map[string]any) {
@@ -111,12 +113,14 @@ func (r *robot) report() {
 	if events == nil {
 		return
 	}
+	go r.watchScreens()
 	tick := 0
 	// still: it has not gone a block from where it was since then — a person
 	// playing is on the move, day and night; a robot standing is stuck or idle
 	var at struct{ x, y, z float64 }
 	since, told := time.Now(), time.Duration(0)
-	var lastBlocks []byte // the blocks told last: told again only when changed
+	var lastBlocks []byte                                       // the blocks told last: told again only when changed
+	var census map[packetid.ClientboundPacketID]bot.CensusEntry // the packet census at the last event
 	for {
 		select {
 		case <-r.ctx.Done():
@@ -150,8 +154,30 @@ func (r *robot) report() {
 				events.emit("blocks", b)
 			}
 		}
+		if tick%(20*stateHz()) == 19*stateHz() { // what the server sent, by packet id, every 20 s: a packet no handler reads, a handler's error
+			var d map[string]any
+			if d, census = bot.CensusEvent(census, r.client.Census()); d != nil {
+				events.emit("packets", d)
+				for _, row := range d["ids"].([]map[string]any) {
+					if n, ok := row["errors"]; ok {
+						log.Printf("robot: packet %v: %v handler errors, the first: %v", row["name"], n, row["firstError"])
+					}
+				}
+			}
+		}
 		tick++
 	}
+}
+
+// entityEntry is an entity as view.entities (and tick.new) give it: where,
+// its type's box, its looks
+func (r *robot) entityEntry(e entities.Entity) map[string]any {
+	en := map[string]any{"id": e.ID, "type": strings.TrimPrefix(e.Type, "minecraft:"), "x": round2(e.X), "y": round2(e.Y), "z": round2(e.Z), "yaw": round2(float64(e.Yaw))}
+	if t, ok := entity.ByName[e.Type]; ok { // the type's box (an adult's)
+		en["w"], en["h"] = t.Width, t.Height
+	}
+	r.entityLooks(e, en)
+	return en
 }
 
 func (r *robot) stateEvent() map[string]any {
@@ -160,7 +186,7 @@ func (r *robot) stateEvent() map[string]any {
 	e := map[string]any{
 		"x": round2(p.X), "y": round2(p.Y), "z": round2(p.Z), "yaw": round2(float64(p.Yaw)), "pitch": round2(float64(p.Pitch)),
 		"health": st.Health, "food": r.food.Load(), "dim": string(r.player.Spawn.Dimension),
-		"doing": r.doing(),
+		"doing": r.doing(), "id": r.player.Login.PlayerID,
 	}
 	if t, ok := r.clock.TimeOfDay(); ok {
 		total, _ := r.clock.DayTicks()
@@ -214,7 +240,20 @@ func (r *robot) stateEvent() map[string]any {
 	if s := slots[45]; s.Count > 0 {
 		e["offhand"] = itemName(int32(s.Item))
 	}
+	// its hotbar as the game shows it at the bottom (the inventory menu's
+	// slots 36–44), the slot selected
+	hotbar := make([]any, 9)
+	for i := range hotbar {
+		if s := slots[36+i]; s.Count > 0 {
+			hotbar[i] = []any{itemName(int32(s.Item)), int(s.Count)}
+		}
+	}
+	e["hotbar"], e["selected"] = hotbar, r.screens.HeldSlot
 	r.screens.Unlock()
+	// eating or drinking: the hand at the mouth, for how long so far
+	if t, need, ok := r.hands.Using(); ok && held.Count > 0 {
+		e["using"] = map[string]any{"item": itemName(int32(held.Item)), "ticks": t, "of": need}
+	}
 	e["inv"] = inv
 	if len(armor) > 0 {
 		e["armor"] = armor
@@ -319,12 +358,7 @@ func (r *robot) viewEvent() map[string]any {
 	}
 	var near []map[string]any
 	for _, e := range r.entities.Nearby(p.X, p.Y, p.Z, viewSize) {
-		en := map[string]any{"id": e.ID, "type": strings.TrimPrefix(e.Type, "minecraft:"), "x": round2(e.X), "y": round2(e.Y), "z": round2(e.Z), "yaw": round2(float64(e.Yaw))}
-		if t, ok := entity.ByName[e.Type]; ok { // the type's box (an adult's)
-			en["w"], en["h"] = t.Width, t.Height
-		}
-		r.entityLooks(e, en)
-		near = append(near, en)
+		near = append(near, r.entityEntry(e))
 	}
 	sort.Slice(near, func(i, j int) bool { return near[i]["type"].(string) < near[j]["type"].(string) })
 	return map[string]any{
@@ -345,16 +379,26 @@ func (r *robot) doing() string {
 }
 
 // running notes the command the robot is on for the events, and how it ended.
-func (r *robot) running(line string) func(answer string, err error) {
+func (r *robot) running(line string, src source) func(answer string, err error) {
 	r.seenMu.Lock()
 	r.current = line
 	r.seenMu.Unlock()
-	start := time.Now()
+	done := r.looking(line, src)
 	return func(answer string, err error) {
 		r.seenMu.Lock()
 		r.current = ""
 		r.seenMu.Unlock()
-		e := map[string]any{"line": line, "ms": time.Since(start).Milliseconds()}
+		done(answer, err)
+	}
+}
+
+// looking notes a look (pos, time …) for the events: beside the order
+// running, it leaves what that order is doing as it is (a look that cleared
+// it hid the order from the watchdog).
+func (r *robot) looking(line string, src source) func(answer string, err error) {
+	start := time.Now()
+	return func(answer string, err error) {
+		e := map[string]any{"line": line, "from": src.String(), "ms": time.Since(start).Milliseconds()}
 		if err != nil {
 			e["error"] = err.Error()
 		} else {

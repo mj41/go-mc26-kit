@@ -306,6 +306,18 @@ func areaHas(item string) func(area) bool {
 	return nil
 }
 
+// nearDanger is a place it was killed out on the land within within of p.
+func (r *robot) nearDanger(p world.BlockPos, within float64) (world.BlockPos, bool) {
+	r.seenMu.Lock()
+	defer r.seenMu.Unlock()
+	for _, d := range r.dangers {
+		if math.Hypot(float64(d.X-p.X), float64(d.Z-p.Z)) <= within {
+			return d, true
+		}
+	}
+	return world.BlockPos{}, false
+}
+
 // cmdScout walks round home, as a person gets to know a place: to eight
 // places radius off (48) and back home, mapping as it goes. It answers what
 // it knows: how many areas, and how many with wood, water, lava.
@@ -334,6 +346,10 @@ func cmdScout(r *robot, args []string) (string, error) {
 		x, z := c.X+int(math.Round(math.Cos(a)*float64(radius))), c.Z+int(math.Round(math.Sin(a)*float64(radius)))
 		g, ok := r.groundAt(x, z, c.Y)
 		if !ok {
+			continue
+		}
+		if d, near := r.nearDanger(g, 24); near {
+			plan("scout: not toward %s: it was killed at %v", compass(a), d)
 			continue
 		}
 		plan("scout: toward %s, to %v", compass(a), g)

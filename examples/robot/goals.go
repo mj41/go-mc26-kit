@@ -63,7 +63,7 @@ var errNoWay = errors.New("no way")
 // gives it, the robot goes looking — leg after leg one way, as a person does
 // who spawned where there is nothing to dig (explore).
 func (r *robot) get(item string, n, depth int) error {
-	if err := r.diedInOrder(); err != nil {
+	if _, err := r.safePoint(); err != nil {
 		return err
 	}
 	err := r.getHere(item, n, depth)
@@ -134,6 +134,10 @@ func (r *robot) explore(try int) error {
 		}
 		if !ok {
 			continue // water: the next
+		}
+		if d, near := r.nearDanger(ground, 24); near {
+			plan("explore: not to %v: it was killed at %v", ground, d)
+			continue
 		}
 		plan("explore: ring %d, %s, to %d %d %d", r.search.ring+1, compass(a), ground.X, ground.Y, ground.Z)
 		if _, err := cmdGoto(r, []string{strconv.Itoa(ground.X), strconv.Itoa(ground.Y), strconv.Itoa(ground.Z)}); err != nil {
@@ -212,11 +216,31 @@ func (r *robot) getHere(item string, n, depth int) error {
 	if rec, ok := r.recipeFor(item, depth); ok {
 		return r.craftGoal(item, n, rec, depth)
 	}
+	// wood deep under its home: up its stairs first, as a person does — the
+	// caves down there have no trees, only the mobs that roam them
+	if slices.Contains(logItems(), item) && r.home != nil {
+		p := r.player.Position()
+		feet := world.BlockPos{X: int(math.Floor(p.X)), Y: int(math.Floor(p.Y + 1e-6)), Z: int(math.Floor(p.Z))}
+		if feet.Y < r.home.y-8 && r.underground(feet) {
+			plan("%sget %s: deep under its home: up home first", indent(depth), item)
+			if _, err := cmdIn(r, nil); err != nil {
+				plan("%sget %s: home: %v", indent(depth), item, err)
+			}
+		}
+	}
 	// dig it where a block that drops it is in sight; make it otherwise (planks
 	// drop from planks, but a person makes them from logs)
 	src := dropSources(item)
 	if len(src) > 0 {
-		if _, ok := r.nearestWhere(src, nil, r.exposed); ok {
+		if pos, ok := r.nearestWhere(src, nil, r.exposed); ok {
+			// coal far off, with logs in its pack: not a walk of fifty blocks
+			// through the woods for a torch (a zombie met it there) — the
+			// charcoal of its logs, made where it is, instead
+			p := r.player.Position()
+			far := math.Hypot(float64(pos.X)+0.5-p.X, float64(pos.Z)+0.5-p.Z) > 24
+			if item == "minecraft:coal" && far && r.countAll(logItems()) > 0 {
+				return fmt.Errorf("%w: the coal ore at %v is far, charcoal from its logs instead", errNoWay, pos)
+			}
 			return r.digGoal(item, n, src, depth)
 		}
 	}
@@ -227,7 +251,8 @@ func (r *robot) getHere(item string, n, depth int) error {
 		return err
 	}
 	// deep down, an ore not in sight is mined for: a tunnel until it shows
-	if len(src) > 0 && r.player.Position().Y < 40 {
+	// (an ore only: planks for a table were once branch-mined for, deep)
+	if len(src) > 0 && r.player.Position().Y < 40 && slices.ContainsFunc(src, func(b string) bool { return strings.HasSuffix(b, "_ore") }) {
 		if err := r.branchMine(src, 4); err != nil {
 			return err
 		}
@@ -316,6 +341,23 @@ func (r *robot) unlockGoal(item string, n, depth int) (error, bool) {
 // book or of the game.
 func (r *robot) knownOption(slot []string, depth int) string {
 	return r.knownOptionExcept(slot, depth, nil)
+}
+
+// oreAt: the block at pos is an ore (its name ends so).
+func (r *robot) oreAt(pos world.BlockPos) bool {
+	st, ok := r.world.BlockAt(pos)
+	return ok && strings.HasSuffix(blockID(st), "_ore")
+}
+
+// otherOption is an option of the slot not in skip that the robot has, or
+// can get by the game's recipes ("" none).
+func (r *robot) otherOption(ing recipes.Ingredient, depth int, skip map[string]bool) string {
+	for _, o := range r.book.Options(ing) {
+		if !skip[o] && (r.ui.Count(o) > 0 || r.knownObtainable(o, depth+1)) {
+			return o
+		}
+	}
+	return ""
 }
 
 // knownOptionExcept is knownOption without the items in skip.
@@ -488,8 +530,13 @@ func (r *robot) craftGoal(item string, n int, rec recipes.Recipe, depth int) err
 		n    int
 	}
 	wants := map[string]int{}
+	slotOf := map[string]recipes.Ingredient{} // the slot each item fills (its other options)
 	for _, ing := range rec.Ingredients {
-		wants[r.chooseOption(ing, depth)] += times
+		o := r.chooseOption(ing, depth)
+		wants[o] += times
+		if _, ok := slotOf[o]; !ok {
+			slotOf[o] = ing
+		}
 	}
 	var list []want
 	for it, k := range wants {
@@ -509,10 +556,27 @@ func (r *robot) craftGoal(item string, n int, rec recipes.Recipe, depth int) err
 	// check them all again until they are all there at once
 	for round := 0; ; round++ {
 		short := false
-		for _, w := range list {
+		for i, w := range list {
 			if r.ui.Count(w.item) < w.n {
 				short = true
-				if err := r.get(w.item, w.n, depth+1); err != nil {
+				err := r.get(w.item, w.n, depth+1)
+				// no way to that one (coal ore far off): the slot's other
+				// options, as unlockGoal tries them — charcoal of the logs it
+				// carries (it once walked the rings for coal for six minutes,
+				// eighteen logs in its pack, for a torch)
+				for tried := map[string]bool{w.item: true}; errors.Is(err, errNoWay); {
+					o := r.otherOption(slotOf[w.item], depth, tried)
+					if o == "" {
+						break
+					}
+					plan("%s%s: %v; %s instead", indent(depth), w.item, err, o)
+					tried[o] = true
+					if err = r.get(o, w.n, depth+1); err == nil {
+						slotOf[o] = slotOf[w.item]
+						list[i].item = o
+					}
+				}
+				if err != nil {
 					return fmt.Errorf("%s: %w", item, err)
 				}
 			}
@@ -525,14 +589,32 @@ func (r *robot) craftGoal(item string, n int, rec recipes.Recipe, depth int) err
 		}
 	}
 	opened := false
-	if table != nil {
+	for try := 0; table != nil && !opened; try++ {
 		if err := r.reach(*table); err != nil {
 			return fmt.Errorf("%s: %w", item, err)
 		}
-		if _, err := cmdOpen(r, []string{strconv.Itoa(table.X), strconv.Itoa(table.Y), strconv.Itoa(table.Z)}); err != nil {
+		_, err := cmdOpen(r, []string{strconv.Itoa(table.X), strconv.Itoa(table.Y), strconv.Itoa(table.Z)})
+		if err == nil {
+			opened = true
+			break
+		}
+		// a table that does not open (not where it seems, the server not
+		// taking the clicks from there): another one, once — not the craft
+		// failed (it once clicked a table three times by a felled tree, no
+		// screen, and the first day's pickaxe was not made)
+		if try == 1 {
 			return fmt.Errorf("%s: open the crafting table: %w", item, err)
 		}
-		opened = true
+		plan("%sthe crafting table at %v does not open: another", indent(depth), *table)
+		if r.badTables == nil {
+			r.badTables = map[world.BlockPos]bool{}
+		}
+		r.badTables[*table] = true
+		pos, terr := r.tableNear(depth)
+		if terr != nil {
+			return fmt.Errorf("%s: open the crafting table: %w; another: %v", item, err, terr)
+		}
+		table = &pos
 	}
 	plan("%scraft %s %d", indent(depth), item, need)
 	made, err := r.ui.Craft(r.ctx, item, need)
@@ -554,7 +636,7 @@ func (r *robot) tableNear(depth int) (world.BlockPos, error) {
 	if pos, ok, err := r.homeBlock("minecraft:crafting_table", depth); ok || err != nil {
 		return pos, err
 	}
-	if pos, ok := r.nearest([]string{"minecraft:crafting_table"}, nil); ok && r.distanceTo(pos) < 12 {
+	if pos, ok := r.nearest([]string{"minecraft:crafting_table"}, r.badTables); ok && r.distanceTo(pos) < 12 {
 		return pos, nil
 	}
 	if err := r.get("minecraft:crafting_table", 1, depth+1); err != nil {
@@ -853,6 +935,9 @@ func (r *robot) reachFrom(pos world.BlockPos, onTree bool) error {
 		if err == nil {
 			return nil
 		}
+		if errors.Is(err, errStopped) || errors.Is(err, errDied) {
+			return err // the order is over: no next place tried
+		}
 		last = err
 	}
 	if last == nil {
@@ -1013,11 +1098,14 @@ func (r *robot) digGoal(item string, n int, sources []string, depth int) error {
 	skip := map[world.BlockPos]bool{}
 	unreached := 0 // in a row
 	dugDown := false
+	tunnels := 0 // dug toward ores out of reach under ground
 	limit := 4*n + 8
 	if byChance(item) {
 		limit = 16*n + 32
 	}
 	r.outFirst()
+	r.toolsFirst(sources, depth)
+	from := r.player.Position() // where it set out (coal is not gone far for)
 	// the drops picked up in a batch, as a person does: not a walk after
 	// each block, but once the blocks dug would make up what is missing, a
 	// handful lie about, or the next block is away from them (left behind)
@@ -1069,6 +1157,13 @@ func (r *robot) digGoal(item string, n int, sources []string, depth int) error {
 				return fmt.Errorf("no %v in sight", sources)
 			}
 		}
+		// coal ore after coal ore further from where it set out (the near ones
+		// out of reach), with logs in its pack: not fifty blocks through the
+		// woods for a torch — charcoal of its logs instead
+		if item == "minecraft:coal" && r.countAll(logItems()) > 0 && math.Hypot(float64(pos.X)+0.5-from.X, float64(pos.Z)+0.5-from.Z) > 24 {
+			collect()
+			return fmt.Errorf("%w: the coal ore at %v is far from where it set out, charcoal from its logs instead", errNoWay, pos)
+		}
 		if dug > 0 && math.Abs(float64(pos.X-lastDug.X))+math.Abs(float64(pos.Z-lastDug.Z)) > 6 {
 			collect() // on to a block away from the drops: them first
 		}
@@ -1086,6 +1181,26 @@ func (r *robot) digGoal(item string, n int, sources []string, depth int) error {
 					plan("%sthe tree out of reach felled from a pillar: %d logs", indent(depth), cut)
 					continue
 				}
+			}
+			// an ore seen through the rock under ground: a tunnel dug to it,
+			// as a person mines toward the iron they see (it once gave up on
+			// iron twenty blocks off, boxed in its stairs by its own furnace,
+			// and walked out to the rings at night)
+			q := r.player.Position()
+			// (deep in the rock only: not from its room under a hill — it once
+			// dug from home toward iron in the hillside and walked off into
+			// a dark wood)
+			deep := !r.skyWithin(16) && (r.home == nil || q.Y < float64(r.home.y-8))
+			if tunnels < 2 && r.oreAt(pos) && deep && math.Hypot(float64(pos.X)+0.5-q.X, float64(pos.Z)+0.5-q.Z) <= 32 {
+				tunnels++
+				plan("%s%v out of reach under ground: a tunnel to it", indent(depth), pos)
+				if terr := r.tunnelToward(pos, 40); terr != nil {
+					plan("%stunnel to %v: %v", indent(depth), pos, terr)
+				}
+				if oerr := r.orderOver(); oerr != nil {
+					return oerr
+				}
+				continue
 			}
 			plan("%s%v out of reach: %v", indent(depth), pos, err)
 			skip[pos] = true
@@ -1385,7 +1500,7 @@ func (r *robot) smeltGoal(item string, n, depth int) (error, bool) {
 		if _, err := cmdOpen(r, []string{strconv.Itoa(pos.X), strconv.Itoa(pos.Y), strconv.Itoa(pos.Z)}); err != nil {
 			return fmt.Errorf("open the furnace: %w", err), true
 		}
-		_, err = r.ui.Smelt(r.ctx, input, fuel, need)
+		_, err = r.smeltWaiting(input, fuel, need)
 		if m, ok := r.screens.Open(); ok {
 			_ = r.screens.Close(m.ID)
 		}
@@ -1576,6 +1691,12 @@ func (r *robot) fillBucket(depth int) error {
 	if known == nil {
 		known = r.bucketWater
 	}
+	// water under ground late in the day: not a trip into the caves the
+	// night comes on in (dusk does not stop work under a roof — it died to
+	// the zombies of a cave lake so, its field's water at dusk)
+	if !ok && known != nil && r.underground(*known) && r.lightLeft() < 4*time.Minute {
+		return fmt.Errorf("the water at %v is under ground: %w", *known, errLate)
+	}
 	if !ok && known != nil && !r.keptOut(*known) {
 		plan("%sto the water it found at %v", indent(depth), *known)
 		if err := r.reach(*known); err != nil {
@@ -1611,4 +1732,38 @@ func (r *robot) fillBucket(depth int) error {
 		return fmt.Errorf("the bucket did not fill at %v", src)
 	}
 	return nil
+}
+
+// toolsFirst makes the stone tool that digs the sources faster when it has
+// no tool of that kind yet and carries what one is made of (three of stone,
+// wood for two sticks): a person makes the axe before the tree and the
+// shovel before the field's dirt, not a day's work by hand. A tool being
+// made does not make another (its sticks' logs dug by hand).
+func (r *robot) toolsFirst(sources []string, depth int) {
+	if r.toolingUp {
+		return
+	}
+	r.toolingUp = true
+	defer func() { r.toolingUp = false }()
+	for _, k := range []struct{ tag, tool, kind string }{
+		{"minecraft:mineable/axe", "minecraft:stone_axe", "minecraft:axes"},
+		{"minecraft:mineable/shovel", "minecraft:stone_shovel", "minecraft:shovels"},
+		{"minecraft:mineable/pickaxe", "minecraft:stone_pickaxe", "minecraft:pickaxes"},
+	} {
+		dugBy := tagBlocks(k.tag)
+		if !slices.ContainsFunc(sources, func(b string) bool { return slices.Contains(dugBy, b) }) {
+			continue
+		}
+		if r.countAll(tagItems(k.kind)) > 0 {
+			continue // one of that kind already (any material)
+		}
+		wood := r.countAll(tagItems("minecraft:planks")) + 4*r.countAll(logItems())
+		if r.countAll(tagItems("minecraft:stone_tool_materials")) < 3 || r.ui.Count("minecraft:stick") < 2 && wood < 2 {
+			continue // nothing to make it of now: by hand, as before
+		}
+		plan("%stools first: a %s before the %s", indent(depth), k.tool, sources[0])
+		if err := r.get(k.tool, 1, depth+1); err != nil {
+			plan("%stools first: %s: %v", indent(depth), k.tool, err)
+		}
+	}
 }

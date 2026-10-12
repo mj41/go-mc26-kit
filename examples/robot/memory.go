@@ -27,7 +27,9 @@ type memory struct {
 	Water  *world.BlockPos  `json:"water,omitempty"` // still water found, for buckets
 	Under  *world.BlockPos  `json:"under,omitempty"` // still water under ground, for buckets
 	Search *memSearch       `json:"search,omitempty"`
-	Map    []mappedArea     `json:"map,omitempty"` // what it saw round home (mapmem.go)
+	Map    []mappedArea     `json:"map,omitempty"`    // what it saw round home (mapmem.go)
+	Day    int              `json:"day,omitempty"`    // the day it lives (-days: the day loop)
+	Danger []world.BlockPos `json:"danger,omitempty"` // where it was killed out on the land
 }
 
 type memRoom struct {
@@ -63,6 +65,10 @@ func (r *robot) recall() memory {
 		m.Search = &memSearch{Center: r.search.center, Ring: r.search.ring, Point: r.search.point}
 	}
 	m.Map = r.atlas.all()
+	m.Day = int(r.liveDay.Load())
+	r.seenMu.Lock()
+	m.Danger = append([]world.BlockPos(nil), r.dangers...)
+	r.seenMu.Unlock()
 	return m
 }
 
@@ -89,7 +95,12 @@ func (r *robot) loadMemory(path string) error {
 		r.addStair(s)
 	}
 	r.field = m.Field
+	r.publishAvoid()
 	r.wild, r.water, r.bucketWater = m.Wild, m.Water, m.Under
+	r.liveDay.Store(int32(m.Day))
+	r.seenMu.Lock()
+	r.dangers = m.Danger
+	r.seenMu.Unlock()
 	if m.Search != nil && m.Search.Center != (world.BlockPos{}) { // none: an older memory's
 		r.search = searchState{on: true, center: m.Search.Center, ring: m.Search.Ring, point: m.Search.Point}
 	}

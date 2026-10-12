@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/mj41/go-mc26-kit/bot/clock"
+	"github.com/mj41/go-mc26-kit/bot/entities"
 	"github.com/mj41/go-mc26-kit/bot/world"
 	"github.com/mj41/go-mc26/level/block"
 )
@@ -86,6 +88,8 @@ func (r *robot) rest(want float32) {
 		return
 	}
 	plan("rest: health %.1f, food %d: healing to %.0f", r.player.Status().Health, r.food.Load(), want)
+	prev := r.waiting.Swap(true) // healing standing still is no stuck (the watchdog)
+	defer r.waiting.Store(prev)
 	deadline := time.Now().Add(2 * time.Minute)
 	for r.player.Status().Health < want && time.Now().Before(deadline) {
 		if r.defend() {
@@ -103,7 +107,9 @@ func (r *robot) rest(want float32) {
 }
 
 func (r *robot) eatIfHungry() {
-	if r.food.Load() > 14 {
+	// full enough — but hurt below the eighteen it heals at, food sought
+	// (below)
+	if f := r.food.Load(); f > 14 && (f >= 18 || r.player.Status().Health > 14) {
 		return
 	}
 	if r.eat() {
@@ -111,17 +117,56 @@ func (r *robot) eatIfHungry() {
 	}
 	// nothing to eat and hungry enough not to heal: food from round it, a
 	// try every two minutes at most (the gathering eats, digs and eats again)
-	if r.food.Load() <= 8 && time.Since(r.foodSought) > 2*time.Minute {
+	// — hurt, at once below the eighteen it heals at (it once scouted on at
+	// food 13, nothing to eat, zombie hit after hit staying, till it died)
+	f := r.food.Load()
+	if (f <= 8 || f < 18 && r.player.Status().Health <= 14) && time.Since(r.foodSought) > 2*time.Minute {
 		r.foodSought = time.Now()
 		r.findFood()
 	}
 }
 
+// meatAnimals are the animals hunted for food (meat that feeds raw too).
+var meatAnimals = []string{"minecraft:cow", "minecraft:pig", "minecraft:sheep", "minecraft:mooshroom", "minecraft:rabbit"}
+
 // findFood makes or gathers something to eat from what is in sight, when it
-// has nothing: bread of its wheat, a stew of a cave's mushrooms (and a bowl
-// of planks), berries off a bush — no leg out to look, and never the kill of
-// a friendly animal.
+// has nothing: an animal near hunted (by day), bread of its wheat, a stew of
+// a cave's mushrooms (and a bowl of planks), berries off a bush — no leg out
+// to look.
 func (r *robot) findFood() {
+	// an animal near, by day: hunted, as a person does on their first days
+	// (its meat eaten raw if need be, cooked at home with the rest)
+	if !r.night() {
+		p := r.player.Position()
+		for _, e := range r.entities.Nearby(p.X, p.Y, p.Z, 24) {
+			if !slices.Contains(meatAnimals, e.Type) {
+				continue
+			}
+			k, err := r.fightWhere(24, 45*time.Second, func(e entities.Entity) bool { return slices.Contains(meatAnimals, e.Type) }, 2)
+			if _, cerr := cmdCollect(r, []string{"8"}); cerr != nil {
+				log.Printf("food: collect: %v", cerr)
+			}
+			plan("food: hunted %d near (%v)", k, err)
+			if r.eat() {
+				return
+			}
+			break
+		}
+		// none near: out hunting round home a few minutes, as a person does
+		// with nothing to eat — not inside a reflex round (minutes it could
+		// answer no other danger in); once it sat at one health for twenty
+		// minutes, an animal never coming within reach
+		if !r.inReflex && r.countAll(foods) == 0 {
+			if ans, err := cmdHunt(r, []string{"2"}); err != nil {
+				plan("food: hunt: %v", err)
+			} else {
+				plan("food: hunt: %s", ans)
+				if r.eat() {
+					return
+				}
+			}
+		}
+	}
 	// fish first: by day, at its field's channel or water it knows
 	if r.canFish() {
 		if ans, err := cmdFish(r, []string{"4"}); err != nil {
@@ -214,7 +259,7 @@ func (r *robot) remember() {
 // nightShift is for work begun in the dark, underground: it reports when the
 // morning has come — time to go up to the day's work (the field, the wood).
 // Work begun by day it never stops.
-func (r *robot) nightShift() func() bool {
+func (r *robot) nightShift(firstLight bool) func() bool {
 	if !r.night() {
 		if r.home != nil {
 			// by day, with a home: a night's command again after a pause —
@@ -223,7 +268,14 @@ func (r *robot) nightShift() func() bool {
 		}
 		return func() bool { return false }
 	}
-	return func() bool { return !r.night() }
+	// firstLight: the night's mine ends before the light (tick 21000, some
+	// two and a half minutes of it left) — up its stairs at the night's end,
+	// home at first light (the day's field work had half a day left after a
+	// climb home); the stairs down go on till the day
+	return func() bool {
+		t, ok := r.clock.TimeOfDay()
+		return !r.night() || firstLight && ok && t >= 21000 && t < 23000
+	}
 }
 
 // upgrade makes the best tools it can from what it carries, as a person does
@@ -245,6 +297,16 @@ func (r *robot) upgrade() {
 		}
 	}()
 	has := func(item string) bool { return r.ui.Count(item) > 0 }
+	// the only pickaxe nine tenths worn (a long descent is one chore, no
+	// housekeeping between): a stone spare before it breaks — an iron one
+	// wore out on the way to the diamonds' level
+	if slices.Contains(r.wornKinds(), "pickaxe") && r.countAll(tagItems("minecraft:stone_tool_materials")) >= 3 {
+		plan("upgrade: the pickaxe nearly worn out: a stone spare")
+		made = true
+		if err := r.get("minecraft:stone_pickaxe", r.countAll(tagItems("minecraft:pickaxes"))+1, 1); err != nil {
+			plan("upgrade: a spare pickaxe: %v", err)
+		}
+	}
 	iron := r.ui.Count("minecraft:iron_ingot") + r.ui.Count("minecraft:raw_iron")
 	for _, t := range []struct {
 		item string
@@ -452,6 +514,15 @@ func cmdDown(r *robot, _ []string) (string, error) {
 	if len(r.stairs) > 0 {
 		if err := r.alongStairs(len(r.stairs) - 1); err != nil {
 			plan("down: %v", err)
+			// near its stairs but no way onto them (a cave beside them):
+			// home first, then down them from the top
+			if r.home != nil {
+				if _, ierr := cmdIn(r, nil); ierr != nil {
+					plan("down: home first: %v", ierr)
+				} else if err := r.alongStairs(len(r.stairs) - 1); err != nil {
+					plan("down: from home: %v", err)
+				}
+			}
 		}
 	}
 	if err := r.goTo(r.deep.at); err != nil {
@@ -469,6 +540,11 @@ func cmdDown(r *robot, _ []string) (string, error) {
 func (r *robot) makePickaxe() bool {
 	if r.newPick {
 		return false // making one already (a worn-out one in the mine)
+	}
+	// at home with too little: the chest's stone and wood (what it stashed,
+	// what it had before a death) — a pickaxe of them, not a night in
+	if r.home != nil && r.distanceTo(r.home.centre()) < 12 && r.countAll(tagItems("minecraft:stone_tool_materials")) < 3 {
+		r.fromChest(append(append([]string{"minecraft:cobblestone", "minecraft:cobbled_deepslate", "minecraft:stick"}, logItems()...), tagItems("minecraft:planks")...)...)
 	}
 	wood := r.countAll(tagItems("minecraft:planks")) + 4*r.countAll(logItems())
 	sticks := r.ui.Count("minecraft:stick")

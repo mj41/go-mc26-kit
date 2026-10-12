@@ -22,7 +22,10 @@ func cmdFarm(r *robot, args []string) (string, error) {
 	if err := r.dayWork(); err != nil { // outdoor work: not started late in the day
 		return "", err
 	}
-	seeds := 8
+	// four seeds to begin with: the grass gives one in eight, and eight of
+	// them took the most of a day-2 farm that the dusk then stopped; the
+	// first harvest gives seeds enough for the rest
+	seeds := 4
 	if len(args) == 1 {
 		v, err := strconv.Atoi(args[0])
 		if err != nil {
@@ -51,6 +54,18 @@ func cmdFarm(r *robot, args []string) (string, error) {
 			}
 		}
 		h, err := r.waterForFarm()
+		// no plot by home and no water known: water looked for, the field
+		// round it — not no field at all (a hilly wood round home once had
+		// no plot, the scouting stayed in hurt, and no field by the fourth
+		// morning)
+		if err != nil && !errors.Is(err, errLate) && r.water == nil {
+			plan("farm: %v: water looked for, the field round it", err)
+			if ans, werr := cmdWater(r, nil); werr != nil {
+				plan("farm: water: %v", werr)
+			} else {
+				plan("farm: water: %s", ans)
+			}
+		}
 		if err != nil {
 			if errors.Is(err, errLate) || r.water == nil || r.coldAt(*r.water) {
 				return "", err // dusk: the field tomorrow, not the wild one instead
@@ -82,11 +97,16 @@ func cmdFarm(r *robot, args []string) (string, error) {
 	w := home
 	plan("farm: around the water at %v", w)
 	r.field = &w
+	r.publishAvoid()
 	tilled, sown, err := r.tendField(w)
-	if err != nil {
-		return "", err
-	}
-	if sown == 0 {
+	if err != nil || sown == 0 {
+		// nothing would grow there (too dark, the soil not what it seemed):
+		// forgotten, another plot next time — not this one tended for good
+		r.field = nil
+		r.publishAvoid()
+		if err != nil {
+			return "", err
+		}
 		return "", fmt.Errorf("nothing sown round the water at %v", w)
 	}
 	return fmt.Sprintf("field at %d %d %d tilled=%d sown=%d", w.X, w.Y, w.Z, tilled, sown), nil
@@ -208,6 +228,7 @@ func (r *robot) tendCells(soil []world.BlockPos) (tilled, sown int, err error) {
 	}
 	type cell struct{ soil world.BlockPos }
 	var cells []cell
+	refused := 0 // seeds the server did not take, before one it did
 	for _, p := range soil {
 		cells = append(cells, cell{p})
 	}
@@ -262,6 +283,11 @@ func (r *robot) tendCells(soil []world.BlockPos) (tilled, sown int, err error) {
 		}
 		if _, err := waitUse(r, func(done func(act.Use)) { r.hands.PlaceOn(above, soil, done) }); err != nil {
 			plan("farm: sow %v: %v", above, err)
+			// the server refusing seed after seed (too dark there, the soil
+			// not what it seemed): not a whole field of them, two seconds each
+			if refused++; refused >= 4 && sown == 0 {
+				return tilled, sown, fmt.Errorf("the server took none of %d seeds (too dark for wheat?): %v", refused, err)
+			}
 			continue
 		}
 		sown++
@@ -396,8 +422,13 @@ func (r *robot) preparePlot(c world.BlockPos) error {
 			plan("farm: soil at %v: %v", p, err)
 		}
 	}
-	if left := r.plotUnready(c); left > 0 {
+	// a few cells it could not get at (a stump on a slope, a cell under a
+	// ledge): the rest sown, as a person does — not the whole field given up
+	// for one cell (the week's day-2 farm and its harvest failed so)
+	if left := r.plotUnready(c); left > 4 {
 		return fmt.Errorf("the plot at %v: %d cells of its ground not ready", c, left)
+	} else if left > 0 {
+		plan("farm: the plot at %v: %d cells not ready, the rest sown", c, left)
 	}
 	return nil
 }
@@ -467,6 +498,7 @@ func cmdHarvest(r *robot, _ []string) (string, error) {
 			plan("harvest: a field by home: %v", err)
 		} else {
 			r.field = &w
+			r.publishAvoid()
 		}
 	} else if r.field != nil && !r.fieldWet(*r.field) && r.bucketable() {
 		if r.plotUnready(*r.field) > 0 { // grown to the field of now: its ground prepared first
@@ -621,15 +653,16 @@ func (r *robot) waterForFarm() (world.BlockPos, error) {
 					if rough {
 						continue
 					}
-					if strict {
-						for _, q := range append(fieldSoil(c), fieldWater(c)...) {
-							if r.terrainOver(q, 24) {
-								dark++
-							}
+					// under a hill's overhang, in shade for good: not even as the
+					// rough plot left (wheat is not placed where it gets no
+					// light — a plot dug into a hillside once refused every seed)
+					for _, q := range append(fieldSoil(c), fieldWater(c)...) {
+						if r.terrainOver(q, 24) {
+							dark++
 						}
-						if dark > 6 {
-							continue // under a hill's overhang: in shade for good
-						}
+					}
+					if dark > 6 && strict || dark > 12 {
+						continue
 					}
 					prep := 2*holes + dig
 					d := math.Hypot(float64(dx), float64(dz))
@@ -664,17 +697,29 @@ func (r *robot) waterForFarm() (world.BlockPos, error) {
 // fieldWaterAt reports whether p is a cell of its field's pool or channel
 // (or one being made): its own water, never sealed off.
 func (r *robot) fieldWaterAt(p world.BlockPos) bool {
-	if r.avoid != nil && r.avoid[p] {
-		return true
+	set := r.avoidSet.Load()
+	return set != nil && (*set)[p]
+}
+
+// publishAvoid makes the cells fieldWaterAt answers for (the dug cells in r.avoid, the field's pool and channels)
+// from r.field and r.avoid as they are now, and publishes them as a whole: the walker's search asks from a goroutine
+// of its own while the robot's jobs change the field, and the cells they change are read only through this set
+// (called by whoever writes r.field or r.avoid, on its own goroutine).
+func (r *robot) publishAvoid() {
+	set := map[world.BlockPos]bool{}
+	for p := range r.avoid {
+		set[p] = true
 	}
 	if r.field != nil {
 		for _, w := range append(fieldPool(*r.field), fieldWater(*r.field)...) {
-			if w == p {
-				return true
-			}
+			set[w] = true
 		}
 	}
-	return false
+	if len(set) == 0 {
+		r.avoidSet.Store(nil)
+		return
+	}
+	r.avoidSet.Store(&set)
 }
 
 // isSource reports whether p holds still water (a source).
@@ -711,11 +756,13 @@ func (r *robot) makeWater(c world.BlockPos) error {
 		}
 	}
 	// dug from beside, never standing on a cell still to dig
-	r.avoid = map[world.BlockPos]bool{}
+	avoid := map[world.BlockPos]bool{}
 	for _, w := range append(fieldPool(c), fieldWater(c)...) {
-		r.avoid[w] = true
+		avoid[w] = true
 	}
-	defer func() { r.avoid = nil }()
+	r.avoid = avoid
+	r.publishAvoid()
+	defer func() { r.avoid = nil; r.publishAvoid() }()
 	for _, w := range append(fieldPool(c), fieldWater(c)...) {
 		if r.openAt(w) || r.isSource(w) {
 			continue

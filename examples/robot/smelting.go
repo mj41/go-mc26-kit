@@ -241,3 +241,12 @@ func (r *robot) furnaceInWall() (world.BlockPos, error) {
 	}
 	return world.BlockPos{}, errors.New("no rock wall near to set a furnace into")
 }
+
+// smeltWaiting smelts at the open furnace, waiting by choice the while: a
+// furnace at work is no stuck (the watchdog stopped a descent at one, as it
+// smelted the iron for a bucket on the way down).
+func (r *robot) smeltWaiting(input, fuel string, n int) (int, error) {
+	prev := r.waiting.Swap(true)
+	defer r.waiting.Store(prev)
+	return r.ui.Smelt(r.ctx, input, fuel, n)
+}
