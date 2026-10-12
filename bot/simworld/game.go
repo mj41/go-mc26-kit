@@ -310,6 +310,11 @@ func settle() {
 	settleByStacks()
 }
 
+// Settle waits till the bot's own goroutines have nothing to run (what Step does after each tick): a test that
+// starts something between two Steps — the brain's round starts a job on a goroutine of its own — calls it before the
+// next Step, or the job's first moment is before the tick or after it by the scheduler's choice.
+func (g *Game) Settle() { settle() }
+
 // settleByStacks is settle outside a bubble: the goroutines' states, read from runtime.Stack.
 func settleByStacks() {
 	buf := make([]byte, 1<<18)

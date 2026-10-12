@@ -112,3 +112,14 @@ decide the bot is done. Points 4 (waiters woken one at a time, `GOMAXPROCS(1)`) 
 runs and are not built; the first run that differs in a bubble is the case for them. Answers from that bot's
 review: its sim body starts no goroutine that blocks on a file, stdin or the network; its events
 writer is a short syscall in the caller's goroutine; a respawn that waited with no context was the one leak, since fixed there.
+
+## What a test starts between two Steps (2026-10-12)
+
+`Step` settles after each tick, so what the bot starts during one is at rest before the next. What a *test* starts
+between two Steps is not: the brain's round, called from the test's loop, starts a job on a goroutine of its own, and
+the job's first action (a walk's goal) ran before the next tick's `Think` or after it by the scheduler's choice — a
+game that started its first walk at tick 6 in one run in twenty and at tick 7 in the rest (the mob game of the bot
+that builds on the kit: 2 to 4 runs in 20 differed, at any GOMAXPROCS, with asynchronous preemption off or on).
+`Game.Settle` is the settle `Step` makes, for a test to call after what it starts; the bot's test loop calls it after
+the round, and 320 runs (8 sets of 20 at GOMAXPROCS 1 and at 4) are identical.
+
