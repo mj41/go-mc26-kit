@@ -135,3 +135,47 @@ func TestPickaxeUseDoesNothing(t *testing.T) {
 		}
 	})
 }
+
+// A block put into a cell of water or lava replaces the fluid (the game's BlockItem: fluids are replaceable);
+// the stones a pickaxe drops besides cobblestone are put like it.
+func TestBlockReplacesWater(t *testing.T) {
+	Run(t, func(t *testing.T) {
+		g := Start(t, Options{View: 2})
+		g.Give("minecraft:cobblestone", 4)
+		g.Give("minecraft:andesite", 4)
+		g.Step(2)
+		g.S.World.Set(2, 64, 0, "minecraft:water")
+		g.S.World.Set(2, 64, 1, "minecraft:lava")
+		use(t, g, world.BlockPos{X: 2, Y: 63, Z: 0}) // the cobblestone in hand, on the ground's top: into the water over it
+		if got := blockAt(g, 2, 64, 0); got != "minecraft:cobblestone" {
+			t.Fatalf("a block put into water: %s, want it in the water's place", got)
+		}
+		if n := g.Count("minecraft:cobblestone"); n != 3 {
+			t.Errorf("%d cobblestone left, want 3", n)
+		}
+		use(t, g, world.BlockPos{X: 2, Y: 63, Z: 1})
+		if got := blockAt(g, 2, 64, 1); got != "minecraft:cobblestone" {
+			t.Fatalf("a block put into lava: %s", got)
+		}
+		// a block that is not replaceable stays: the stone put over it is refused
+		g.S.World.Set(2, 64, -1, "minecraft:stone")
+		use(t, g, world.BlockPos{X: 2, Y: 63, Z: -1})
+		if got := blockAt(g, 2, 64, -1); got != "minecraft:stone" {
+			t.Errorf("a block put where one stands: %s", got)
+		}
+	})
+}
+
+func TestPickaxeStonesAreUsable(t *testing.T) {
+	Run(t, func(t *testing.T) {
+		for _, stone := range []string{"andesite", "diorite", "granite", "tuff", "cobbled_deepslate", "deepslate"} {
+			g := Start(t, Options{View: 2})
+			g.Give("minecraft:"+stone, 2)
+			g.Step(2)
+			use(t, g, world.BlockPos{X: 2, Y: 63, Z: 0})
+			if got := blockAt(g, 2, 64, 0); got != "minecraft:"+stone {
+				t.Errorf("%s put: %s", stone, got)
+			}
+		}
+	})
+}

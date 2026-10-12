@@ -74,7 +74,10 @@ func (g *Game) useItemOn(p fakeserver.Packet) error {
 		}
 		d := faceOffset(int(face))
 		x, y, z := pos.X+d[0], pos.Y+d[1], pos.Z+d[2]
-		if g.S.World.At(x, y, z) != 0 { // (replaceable blocks — water, grass — are not modelled)
+		if at != 0 && block.Replaceable(at) { // a block put on a replaceable one (grass) goes in its place, not beside it
+			x, y, z = pos.X, pos.Y, pos.Z
+		}
+		if cur := g.S.World.At(x, y, z); cur != 0 && !block.Replaceable(cur) { // water, lava, grass give way to the block (BlockState.canBeReplaced)
 			return g.ack(seq)
 		}
 		if g.inPlayer(x, y, z) { // a block where the player stands is refused (BlockItem: the shape collides with an entity)
@@ -141,6 +144,9 @@ func (g *Game) setAndAck(x, y, z int, name string, seq pk.VarInt) error {
 func placeable(item string) (string, bool) {
 	switch {
 	case item == "minecraft:torch", item == "minecraft:crafting_table", item == "minecraft:furnace", item == "minecraft:chest", item == "minecraft:cobblestone", item == "minecraft:dirt", item == "minecraft:stone",
+		// the stones a pickaxe drops besides cobblestone, and deepslate's: plain states
+		item == "minecraft:andesite", item == "minecraft:diorite", item == "minecraft:granite", item == "minecraft:tuff",
+		item == "minecraft:cobbled_deepslate", item == "minecraft:deepslate",
 		strings.HasSuffix(item, "_planks"):
 		return item, true
 	}
