@@ -1,4 +1,10 @@
-// Usage: go run examples/ping/ping.go localhost
+// Mcping asks a server for its entry in the server list, as the multiplayer screen does, and prints it: the
+// version, the description, the round trip, the players.
+//
+//	go run ./examples/mcping localhost:25565
+//	go run ./examples/mcping -f icon.png localhost   # also saves the server's icon
+//
+// mcping_test.go runs it against a fake server (examples/README.md).
 package main
 
 import (
@@ -8,6 +14,7 @@ import (
 	"fmt"
 	"image"
 	"image/png"
+	"io"
 	"os"
 	"strings"
 	"text/template"
@@ -17,13 +24,9 @@ import (
 
 	"github.com/mj41/go-mc26-kit/bot"
 	"github.com/mj41/go-mc26/chat"
-	"github.com/mj41/go-mc26/data/version"
 )
 
-var (
-	protocol = flag.Int("p", version.ProtocolVersion, "The protocol version number sent during ping")
-	favicon  = flag.String("f", "", "If specified, the server's icon will be save to")
-)
+var favicon = flag.String("f", "", "save the server's icon to this PNG file")
 
 type status struct {
 	Description chat.Message
@@ -78,34 +81,51 @@ func (s *status) String() string {
 }
 
 func usage() {
-	_, _ = fmt.Fprintf(flag.CommandLine.Output(), "Usage:\n%s [-f] [-p] <address>[:port]\n", os.Args[0])
+	_, _ = fmt.Fprintf(flag.CommandLine.Output(), "Usage:\n%s [-f icon.png] <address>[:port]\n", os.Args[0])
 	flag.PrintDefaults()
 }
 
 func main() {
-	flag.Parse()
 	flag.Usage = usage
+	flag.Parse()
 	addr := flag.Arg(0)
 	if addr == "" {
-		fmt.Println("")
 		flag.Usage()
 		os.Exit(2)
 	}
+	if err := run(addr, *favicon, os.Stdout); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
 
-	fmt.Printf("MCPING (%s):", addr)
+// run pings addr and prints its status to w; with icon set, it saves the server's icon there.
+func run(addr, icon string, w io.Writer) error {
+	fmt.Fprintf(w, "MCPING (%s):", addr)
 	resp, delay, err := bot.PingAndList(addr)
 	if err != nil {
-		fmt.Printf("Ping and list server fail: %v", err)
-		os.Exit(1)
+		return fmt.Errorf("ping and list server fail: %w", err)
 	}
-
 	var s status
-	err = json.Unmarshal(resp, &s)
-	if err != nil {
-		fmt.Print("Parse json response fail:", err)
-		os.Exit(1)
+	if err := json.Unmarshal(resp, &s); err != nil {
+		return fmt.Errorf("parse json response fail: %w", err)
 	}
 	s.Delay = delay
-
-	fmt.Print(&s)
+	fmt.Fprint(w, &s)
+	if icon == "" {
+		return nil
+	}
+	img, err := s.Favicon.ToImage()
+	if err != nil {
+		return err
+	}
+	f, err := os.Create(icon)
+	if err != nil {
+		return err
+	}
+	if err := png.Encode(f, img); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }

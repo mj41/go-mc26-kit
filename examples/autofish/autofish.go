@@ -1,8 +1,17 @@
+// Autofish fishes: it casts its rod, reels in at the splash of a bite and casts again, and casts again
+// when no fish has bitten for 45 s. Give it a rod in its main hand.
+//
+//	go run ./examples/autofish -address localhost:25565 -name Fisher
+//
+// autofish_test.go runs it against a fake server that plays the fishing (examples/README.md).
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
+	"os"
+	"os/signal"
 	"time"
 
 	//"github.com/mattn/go-colorable"
@@ -12,7 +21,7 @@ import (
 	"github.com/mj41/go-mc26-kit/bot/msg"
 	"github.com/mj41/go-mc26-kit/bot/playerlist"
 	"github.com/mj41/go-mc26/chat"
-	_ "github.com/mj41/go-mc26/data/lang/en-us"
+	"github.com/mj41/go-mc26/data/soundid"
 	pk "github.com/mj41/go-mc26/net/packet"
 	"github.com/mj41/go-mc26/protocol/play"
 	"github.com/mj41/go-mc26/protocol/types"
@@ -32,14 +41,26 @@ var (
 	playerList  *playerlist.PlayerList
 	chatHandler *msg.Manager
 
-	watch chan time.Time
+	watch   chan time.Time  // a reel, told to the watchdog
+	running context.Context // run's: its end stops the watchdog
 )
 
 func main() {
 	flag.Parse()
 	// log.SetOutput(colorable.NewColorableStdout()) // optional for colorable output
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	if err := run(ctx, *address, *name, bot.JoinOptions{}); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// run fishes on address as name till ctx ends or the connection does. opts is how it dials: the zero value
+// for a real server (a test gives a fake server's in-memory dialer).
+func run(ctx context.Context, address, name string, opts bot.JoinOptions) error {
+	running = ctx
 	c = bot.NewClient()
-	c.Auth.Name = *name
+	c.Auth.Name = name
 	p = basic.NewPlayer(c, basic.DefaultSettings, basic.EventsListener{
 		GameStart:  onGameStart,
 		Disconnect: onDisconnect,
@@ -57,17 +78,28 @@ func main() {
 	c.Events.AddListener(soundListener)
 
 	// Login
-	err := c.JoinServer(*address)
-	if err != nil {
-		log.Fatal(err)
+	if err := c.JoinServerWithOptions(address, opts); err != nil {
+		return err
 	}
+	defer c.Close()
 	log.Println("Login success")
 
+	done := make(chan struct{}) // the end of ctx closes the connection, which ends HandleGame
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			c.Close()
+		case <-done:
+		}
+	}()
+
 	// JoinGame
-	err = c.HandleGame()
-	if err != nil {
-		log.Fatal(err)
+	err := c.HandleGame() // never nil
+	if ctx.Err() != nil {
+		return nil
 	}
+	return err
 }
 
 func onDeath() error {
@@ -79,8 +111,8 @@ func onDeath() error {
 func onGameStart() error {
 	log.Println("Game start")
 
-	watch = make(chan time.Time)
-	go watchDog()
+	watch = make(chan time.Time, 1)
+	go watchDog(running)
 
 	return UseItem(types.InteractionHandMainHand)
 }
@@ -107,7 +139,9 @@ func UseItem(hand types.InteractionHand) error {
 
 //goland:noinspection SpellCheckingInspection
 func onSound(id int, category int, x, y, z float64, volume, pitch float32) error {
-	if id == 609 { // entity.fishing_bobber.splash
+	// A bite is the bobber's splash, matched by name: a sound's registry id moves between versions (609 in
+	// an older one, 644 in 26.3), so a number here stops recognising the bite.
+	if name, _ := soundid.GetSoundNameByID(soundid.SoundID(id)); name == "entity.fishing_bobber.splash" {
 		if err := UseItem(types.InteractionHandMainHand); err != nil { // retrieve
 			return err
 		}
@@ -116,7 +150,10 @@ func onSound(id int, category int, x, y, z float64, volume, pitch float32) error
 		if err := UseItem(types.InteractionHandMainHand); err != nil { // throw
 			return err
 		}
-		watch <- time.Now()
+		select {
+		case watch <- time.Now():
+		default: // (one already told)
+		}
 	}
 	return nil
 }
@@ -141,15 +178,27 @@ func onDisconnect(c chat.Message) error {
 	return nil
 }
 
-func watchDog() {
+// watchDog casts again when no fish has bitten for timeout seconds, till ctx ends.
+func watchDog(ctx context.Context) {
 	to := time.NewTimer(time.Second * timeout)
+	defer to.Stop()
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-watch:
 		case <-to.C:
+			// with the bobber out a use reels it in, so casting again is two: one use alone would leave
+			// no line in the water till the next timeout
 			log.Println("rethrow")
-			if err := UseItem(types.InteractionHandMainHand); err != nil {
-				panic(err)
+			err := UseItem(types.InteractionHandMainHand) // reel in
+			if err == nil {
+				time.Sleep(time.Millisecond * 300)
+				err = UseItem(types.InteractionHandMainHand) // cast
+			}
+			if err != nil {
+				log.Print("rethrow: ", err) // the connection is gone
+				return
 			}
 		}
 		to.Reset(time.Second * timeout)

@@ -6,6 +6,10 @@
 //
 // By using this tool, you can convert the offline data into online data.
 // The players will keep everything they got, yay!
+//
+//	go run ./examples/playerdataconvert -save path/to/server   # the folder with usercache.json and world/
+//
+// main_test.go runs it on a save the library's save package writes (examples/README.md).
 package main
 
 import (
@@ -27,26 +31,35 @@ var (
 
 func main() {
 	flag.Parse()
+	if err := run(*savePath, *convertPlayerData, *convertEntities, *convertAdvancements); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
 
-	usercaches, err := readUsercache(filepath.Join(*savePath, "usercache.json"))
+// lookup gives a player name's online-mode name and uuid: Mojang's profile API (a test gives its own).
+var lookup = usernameToUUID
+
+// run converts the save at savePath: the player files, the pets' owners and the advancements of every
+// player in usercache.json, from their offline uuid to their online one.
+func run(savePath string, playerData, entities, advancements bool) error {
+	usercaches, err := readUsercache(filepath.Join(savePath, "usercache.json"))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to parse usercache file: %v\n", err)
-		return
+		return fmt.Errorf("failed to parse usercache file: %w", err)
 	}
 	fmt.Printf("Successfully reading usercache\n")
 	m := mappingUsers(usercaches)
 
-	if *convertPlayerData {
-		readPlayerdata(filepath.Join(*savePath, "world", "playerdata"), m)
+	if playerData {
+		readPlayerdata(filepath.Join(savePath, "world", "playerdata"), m)
 	}
-
-	if *convertEntities {
-		readEntities(filepath.Join(*savePath, "world", "entities"), m)
+	if entities {
+		readEntities(filepath.Join(savePath, "world", "entities"), m)
 	}
-
-	if *convertAdvancements {
-		readAdvancements(filepath.Join(*savePath, "world", "advancements"), m)
+	if advancements {
+		readAdvancements(filepath.Join(savePath, "world", "advancements"), m)
 	}
+	return nil
 }
 
 type UserCache struct {
@@ -77,7 +90,7 @@ func mappingUsers(users []UserCache) map[uuid.UUID]UserCache {
 		// 	name = v
 		// }
 
-		name, id, err := usernameToUUID(name)
+		name, id, err := lookup(name)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Unable to fetch username for %s from Mojang server: %v\n", name, err)
 			continue

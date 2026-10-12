@@ -15,6 +15,10 @@ func usernameToUUID(name string) (string, uuid.UUID, error) {
 	if err != nil {
 		return "", id, err
 	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", id, fmt.Errorf("profile of %s: %s", name, resp.Status)
+	}
 
 	var body struct {
 		Name string `json:"name"`

@@ -1,14 +1,11 @@
 # mcping
 
-A ping tool for Minecraft: Java Edition.  
-适用于Minecraft: Java Edition的ping工具。
+Asks a Minecraft: Java Edition server for its entry in the server list, as the multiplayer
+screen does, and prints it: the version, the description, the round trip, the players.
 
-Install with go tools:  
-    ```go get -u github.com/Tnze/go-mc/cmd/mcping```
-    `$GOPATH/bin` should in your `$PATH`.
+```
+go run ./examples/mcping localhost:25565
+go run ./examples/mcping -f icon.png localhost      # also saves the server's icon
+```
 
-Install with Homebrew:  
-    ```brew tap Tnze/tap && brew install mcping```
-
-Usage:  
-    ```mcping <hostname>[:port]```
+The port defaults to 25565. A server of any version answers; the version it reports is its own.

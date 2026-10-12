@@ -1,17 +1,24 @@
-// Daze is a basic bot example that join a server as client with these features:
-// - Say "Hello, world" when game started.
-// - Just standing there and do nothing.
-// - Receive chat message and print it.
-// - Receive player list and store it in memory.
-// - Receive chunk data and load/unload them.
-// - Receive inventory items and print them.
-// - Automatically reborn after 5 seconds of death.
+// Daze is a bot with a console: what is typed on its stdin is sent as chat
+// (a line starting with / as a command). It
+//   - says "Hello, world" when the game starts,
+//   - prints the chat it receives: system messages, players' messages (with who
+//     sent them, msg.PlayerChat) and disguised ones,
+//   - keeps the player list, loads and unloads the chunks the server sends,
+//     prints the inventory slots that change,
+//   - respawns 5 seconds after it dies.
+//
+// Offline mode needs only -name; for an online-mode server, pass -uuid and -token
+// (examples/microsoft prints them). mc26's end-to-end run drives this bot through
+// its console and reads its output.
 package main
 
 import (
 	"errors"
 	"flag"
+	"io"
 	"log"
+	"os"
+	"sync"
 	"time"
 
 	//"github.com/mattn/go-colorable"
@@ -23,7 +30,6 @@ import (
 	"github.com/mj41/go-mc26-kit/bot/screen"
 	"github.com/mj41/go-mc26-kit/bot/world"
 	"github.com/mj41/go-mc26/chat"
-	_ "github.com/mj41/go-mc26/data/lang/zh-cn"
 	"github.com/mj41/go-mc26/data/registryid"
 	"github.com/mj41/go-mc26/level"
 )
@@ -47,12 +53,19 @@ var (
 func main() {
 	flag.Parse()
 	// log.SetOutput(colorable.NewColorableStdout())
-	client = bot.NewClient()
-	client.Auth = bot.Auth{
-		Name: *name,
-		UUID: *playerID,
-		AsTk: *accessToken,
+	auth := bot.Auth{Name: *name, UUID: *playerID, AsTk: *accessToken}
+	if err := run(*address, auth, bot.JoinOptions{}, os.Stdin); err != nil {
+		log.Fatal(err)
 	}
+}
+
+// run is the bot: it joins address as auth, reads its console (lines sent as chat, or as commands with a
+// leading /), and returns when the server kicks it or the connection ends. opts is how it dials: the zero
+// value for a real server (daze_test.go gives a fake server's in-memory dialer).
+func run(address string, auth bot.Auth, opts bot.JoinOptions, stdin io.Reader) error {
+	consoleIn, consoleOnce = stdin, sync.Once{}
+	client = bot.NewClient()
+	client.Auth = auth
 	player = basic.NewPlayer(client, basic.DefaultSettings, basic.EventsListener{
 		GameStart:    onGameStart,
 		Disconnect:   onDisconnect,
@@ -61,9 +74,9 @@ func main() {
 	})
 	playerList = playerlist.New(client)
 	chatHandler = msg.New(client, player, playerList, msg.EventsHandler{
-		SystemChat:        onSystemMsg,
-		PlayerChatMessage: onPlayerMsg,
-		DisguisedChat:     onDisguisedMsg,
+		SystemChat:    onSystemMsg,
+		PlayerChat:    onPlayerMsg,
+		DisguisedChat: onDisguisedMsg,
 	})
 	worldManager = world.NewWorld(client, player, world.EventsListener{
 		LoadChunk:   onChunkLoad,
@@ -76,28 +89,24 @@ func main() {
 	})
 
 	// Login
-	err := client.JoinServer(*address)
-	if err != nil {
-		log.Fatal(err)
+	if err := client.JoinServerWithOptions(address, opts); err != nil {
+		return err
 	}
+	defer client.Close()
 	log.Println("Login success")
 
 	// JoinGame
 	for {
-		if err = client.HandleGame(); err == nil {
-			panic("HandleGame never return nil")
-		}
-
+		err := client.HandleGame() // never nil
 		if err2 := new(bot.PacketHandlerError); errors.As(err, err2) {
-			if err := new(DisconnectErr); errors.As(err2, err) {
-				log.Print("Disconnect, reason: ", err.Reason)
-				return
-			} else {
-				// print and ignore the error
-				log.Print(err2)
+			if kicked := new(bot.DisconnectErr); errors.As(err2, kicked) {
+				log.Print("Disconnect, reason: ", chat.Message(*kicked))
+				return nil
 			}
+			// print and ignore the error
+			log.Print(err2)
 		} else {
-			log.Fatal(err)
+			return err
 		}
 	}
 }
@@ -129,12 +138,17 @@ func onSystemMsg(c chat.Message, overlay bool) error {
 	return nil
 }
 
-func onPlayerMsg(msg chat.Message, validated bool) error {
+// onPlayerMsg prints a player's message as the client shows it. m.Sender, m.Name
+// and m.Content are what a bot answering it uses (examples/minimal does).
+func onPlayerMsg(m msg.PlayerChat) error {
+	if m.Disguised {
+		return nil // onDisguisedMsg prints those
+	}
 	var prefix string
-	if !validated {
+	if !m.Validated {
 		prefix = "[Not Secure] "
 	}
-	log.Printf("%sPlayer: %v", prefix, msg)
+	log.Printf("%sPlayer: %v", prefix, m.Message)
 	return nil
 }
 
@@ -181,15 +195,7 @@ func onHealthChange(health float32, foodLevel int32, foodSaturation float32) err
 	return nil
 }
 
-type DisconnectErr struct {
-	Reason chat.Message
-}
-
-func (d DisconnectErr) Error() string {
-	return "disconnect: " + d.Reason.String()
-}
-
 func onDisconnect(reason chat.Message) error {
 	// return an error value so that we can stop main loop
-	return DisconnectErr{Reason: reason}
+	return bot.DisconnectErr(reason)
 }
