@@ -444,6 +444,23 @@ func (g *Game) Teleport(x, y, z float64) {
 	g.sync() // the bot has taken it (and confirmed it) before its next tick
 }
 
+// SetBlock changes a block while the game runs and tells the player (a block update), as a cell turning to
+// water under the flow does after the player dug it. state is the block's name (its plain state) or, with
+// properties, the text the game writes ("minecraft:water[level=0]").
+func (g *Game) SetBlock(x, y, z int, state string) {
+	g.T.Helper()
+	var st block.StateID
+	if strings.Contains(state, "[") {
+		st = stateByText(state)
+	} else {
+		st = fakeserver.State(state)
+	}
+	g.S.World.SetState(x, y, z, st)
+	if err := g.S.Send(play.BlockUpdate{Pos: pk.Position{X: x, Y: y, Z: z}, BlockState: pk.VarInt(st)}); err != nil {
+		g.T.Fatal(err)
+	}
+}
+
 // play is the server's answer to one packet.
 func (g *Game) play(p fakeserver.Packet) error {
 	// the arm's swing is a packet of another name in each version (ServerboundSwing,

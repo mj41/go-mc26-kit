@@ -179,3 +179,23 @@ func TestPickaxeStonesAreUsable(t *testing.T) {
 		}
 	})
 }
+
+// SetBlock changes a block under the player's eyes, as a flow turns a dug cell to water: the bot's world has it
+// at once.
+func TestGameSetBlock(t *testing.T) {
+	Run(t, func(t *testing.T) {
+		g := Start(t, Options{View: 2})
+		g.Step(2)
+		at := world.BlockPos{X: 2, Y: 64, Z: 0}
+		g.SetBlock(2, 64, 0, "minecraft:water")
+		g.Step(2)
+		if st, ok := g.B.World.BlockAt(at); !ok || block.StateList[st].ID() != "minecraft:water" {
+			t.Fatalf("the bot sees %v after SetBlock, want water", st)
+		}
+		g.SetBlock(2, 64, 0, "minecraft:water[level=3]")
+		g.Step(2)
+		if st, _ := g.B.World.BlockAt(at); world.StateString(st) != "minecraft:water[level=3]" {
+			t.Errorf("a state with properties: the bot sees %s", world.StateString(st))
+		}
+	})
+}
