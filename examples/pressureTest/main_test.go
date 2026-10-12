@@ -58,7 +58,11 @@ func TestPressureServerFull(t *testing.T) {
 		if err := s.WaitPlayers(3, 5*time.Second); err != nil {
 			t.Fatal(err)
 		}
-		synctest.Wait() // the fourth refused, waiting its 3 s to try again
+		// the clients start a millisecond apart (run): the fourth's turn comes after the third's login, which
+		// WaitPlayers may return before — a moment of the bubble's clock for it, then every goroutine at rest: the
+		// fourth refused, waiting its 3 s to try again
+		time.Sleep(10 * time.Millisecond)
+		synctest.Wait()
 		if !strings.Contains(out.String(), "Login fail") || !strings.Contains(out.String(), "server_full") && !strings.Contains(out.String(), "The server is full!") {
 			t.Errorf("no client was refused as the server is full:\n%s", out)
 		}
