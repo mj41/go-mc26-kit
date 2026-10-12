@@ -247,6 +247,9 @@ func (s *Server) AcceptPlayer(name string, id uuid.UUID, _ *user.PublicKey, _ []
 		if s.multi() && got.ID == packetid.ServerboundPlayChat {
 			s.relayChat(p, got)
 		}
+		if got.ID == packetid.ServerboundPlayChunkBatchReceived {
+			s.batchReceived(p)
+		}
 		if s.Fishing != nil && got.ID == packetid.ServerboundPlayUseItem {
 			s.Fishing.use(s, p)
 		}
@@ -275,25 +278,10 @@ func (s *Server) keepAlive(p *Player) {
 	}
 }
 
-// sendChunks sends a player the world's chunks round the spawn, as one batch.
+// sendChunks sends a player the world's chunks round the spawn: the first batch of its chunk sender (chunks.go),
+// the rest as the client answers the batches.
 func (s *Server) sendChunks(p *Player) error {
-	r := s.World.Radius
-	if err := p.Send(play.SetChunkCacheCenter{}); err != nil {
-		return err
-	}
-	if err := p.Send(play.ChunkBatchStart{}); err != nil {
-		return err
-	}
-	n := 0
-	for cx := -r; cx <= r; cx++ {
-		for cz := -r; cz <= r; cz++ {
-			if err := p.Send(s.World.chunk(cx, cz)); err != nil {
-				return err
-			}
-			n++
-		}
-	}
-	if err := p.Send(play.ChunkBatchFinished{BatchSize: pk.VarInt(n)}); err != nil {
+	if err := s.moveView(p, 0, 0); err != nil {
 		return err
 	}
 	// the level's chunks are loading: from this event the client waits for

@@ -27,6 +27,7 @@ type Fishing struct {
 
 	mu     sync.Mutex
 	bobber int32       // its entity id; 0: none out
+	shown  bool        // the player was told of it (its chunk was sent)
 	bitAt  time.Time   // when the fish on the hook bit; zero: none on
 	timer  *time.Timer // the next bite, or the fish getting away
 	caught int
@@ -65,8 +66,36 @@ func cmpOr(d, def time.Duration) time.Duration {
 	return def
 }
 
-// bobberAt is where a cast lands: a few blocks in front of the spawn.
-var bobberAt = [3]float64{Spawn[0], Spawn[1], Spawn[2] + 4}
+// bobberAt is where a cast lands: a few blocks in front of the player.
+func bobberAt(p *Player) [3]float64 {
+	at := p.Pos()
+	return [3]float64{at[0], at[1], at[2] + 4}
+}
+
+// told is whether the bobber is in a chunk the player has been sent: the game tells an entity only to the
+// players that track it (ChunkMap.isChunkTracked), and later, when the chunk comes.
+func (f *Fishing) told(p *Player) bool {
+	at := bobberAt(p)
+	return p.chunks.tracked(floorDiv16(at[0]), floorDiv16(at[2]))
+}
+
+// chunksSent is a batch of chunks gone to the player: a bobber out that it was not told of, in one of
+// them, is told now.
+func (f *Fishing) chunksSent(p *Player) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.bobber != 0 && !f.shown && f.told(p) {
+		f.show(p)
+	}
+}
+
+// show tells the player of the bobber; the caller holds f.mu.
+func (f *Fishing) show(p *Player) {
+	at := bobberAt(p)
+	f.shown = true
+	_ = p.Send(play.AddEntity{ID: pk.VarInt(f.bobber), Type: pk.VarInt(slices.Index(registryid.EntityType, "minecraft:fishing_bobber")),
+		X: pk.Double(at[0]), Y: pk.Double(at[1]), Z: pk.Double(at[2]), Data: pk.VarInt(p.EntityID)})
+}
 
 // use is a UseItem of the player: a cast with no bobber out, else a reel.
 func (f *Fishing) use(s *Server, p *Player) {
@@ -80,8 +109,9 @@ func (f *Fishing) use(s *Server, p *Player) {
 		s.lastID++
 		f.bobber = s.lastID
 		s.mu.Unlock()
-		_ = p.Send(play.AddEntity{ID: pk.VarInt(f.bobber), Type: pk.VarInt(slices.Index(registryid.EntityType, "minecraft:fishing_bobber")),
-			X: pk.Double(bobberAt[0]), Y: pk.Double(bobberAt[1]), Z: pk.Double(bobberAt[2]), Data: pk.VarInt(p.EntityID)})
+		if f.told(p) {
+			f.show(p)
+		}
 		f.wait(p)
 		return
 	}
@@ -89,13 +119,15 @@ func (f *Fishing) use(s *Server, p *Player) {
 	if f.timer != nil {
 		f.timer.Stop()
 	}
-	_ = p.Send(play.RemoveEntities{EntityIds: types.List[pk.VarInt, *pk.VarInt]{pk.VarInt(f.bobber)}})
+	if f.shown {
+		_ = p.Send(play.RemoveEntities{EntityIds: types.List[pk.VarInt, *pk.VarInt]{pk.VarInt(f.bobber)}})
+	}
 	if !f.bitAt.IsZero() && time.Since(f.bitAt) <= f.hooked() {
 		f.caught++
 		cod := types.ItemStack{SlotData: component.SlotData{Count: 1, Item: pk.VarInt(slices.Index(registryid.Item, "minecraft:cod"))}}
 		_ = p.Send(play.ContainerSetSlot{ContainerID: 0, Slot: 36 + pk.Short(f.caught%9), ItemStack: cod}) // into the hotbar
 	}
-	f.bobber, f.bitAt = 0, time.Time{}
+	f.bobber, f.shown, f.bitAt = 0, false, time.Time{}
 }
 
 // wait starts the wait for the next bite; the caller holds f.mu.
@@ -112,8 +144,9 @@ func (f *Fishing) bite(p *Player) {
 		return
 	}
 	f.bitAt = time.Now()
+	at := bobberAt(p)
 	_ = p.Send(play.Sound{Sound: types.Holder[types.SoundEvent, *types.SoundEvent]{ID: pk.VarInt(splash + 1)}, // registry id + 1
-		Source: types.SoundSourceNeutral, X: pk.Int(bobberAt[0] * 8), Y: pk.Int(bobberAt[1] * 8), Z: pk.Int(bobberAt[2] * 8), // eighths of a block
+		Source: types.SoundSourceNeutral, X: pk.Int(at[0] * 8), Y: pk.Int(at[1] * 8), Z: pk.Int(at[2] * 8), // eighths of a block
 		Volume: 0.25, Pitch: 1})
 	bitAt := f.bitAt
 	f.timer = time.AfterFunc(f.hooked(), func() {

@@ -74,6 +74,7 @@ func NewPlayer(c *bot.Client, settings Settings, events EventsListener) *Player 
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayStoreCookie, F: p.handleStoreCookiePacket},
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayUpdateTags, F: p.handleUpdateTags},
 	)
+	p.attachChunkBatch()
 	p.attachPosition()
 	p.attachAttributes()
 	p.attachStatus()

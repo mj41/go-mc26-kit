@@ -141,10 +141,9 @@ var soundListener = bot.PacketHandler{
 // is the bot's own entity id (its owner) was added and not yet removed. The bot does not assume it — a cast with no rod in
 // the hand (the game start, before the rod is given) puts none out — it asks this before it reels in or casts.
 var float struct {
-	mu  sync.Mutex
-	id  int32         // the bobber's entity id; 0: none out
-	ch  chan struct{} // closed when the state changes (and made again)
-	own int32         // the bot's entity id
+	mu sync.Mutex
+	id int32         // the bobber's entity id; 0: none out
+	ch chan struct{} // closed when the state changes (and made again)
 }
 
 // resetBobber is the state of a run that begins: none out, a channel made inside the run (a test's bubble owns it).

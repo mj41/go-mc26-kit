@@ -49,3 +49,13 @@ bobber movement. About 80 lines in `bot/fakeserver`, beside `Chat` and `Kick`.
 **Build it.** It is a small model (well under a page, about 80 lines), and the test it allows has
 already found the reason to exist: an example that cannot fish on any version we support. The
 alternative, autofish compiled only with the reason, would leave that example broken.
+
+## The bobber and the chunk sender
+
+The game tells an entity only to a player that tracks it: the chunk is in the player's view and not pending
+in its chunk sender (`ChunkMap.isChunkTracked`). The fake server keeps a sender per player as the game does
+(chunks.go): the join's chunks are one batch, and the next batch (the chunks of a place the player was moved
+to with `Server.Teleport`) goes only after the client answered the first with ChunkBatchReceived. A bobber
+cast into a pending chunk is not told (its splash is, as the game broadcasts a sound by distance), and is
+when the chunk is sent. A client that never answers the batches is never told of it: that is the bench's
+failure this guards against (bot/basic answers for every client).

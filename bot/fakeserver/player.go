@@ -34,13 +34,16 @@ type Player struct {
 	conn   *mcnet.Conn
 	got    []Packet
 	listed map[string]uuid.UUID // the players Chat has put in this player's list
+	pos    [3]float64           // where it is (Spawn, or where Teleport put it)
+	tpID   int32                // the last teleport id told
+	chunks *chunkSender         // its chunks (chunks.go)
 	news   chan struct{}        // a packet came, or the player left
 	joined chan struct{}
 	left   chan struct{}
 }
 
 func newPlayer() *Player {
-	return &Player{news: make(chan struct{}, 1), joined: make(chan struct{}), left: make(chan struct{})}
+	return &Player{news: make(chan struct{}, 1), joined: make(chan struct{}), left: make(chan struct{}), pos: Spawn, tpID: 1, chunks: newChunkSender()}
 }
 
 // the is the player the single-player API is about: the first in play, or before any, the one the first

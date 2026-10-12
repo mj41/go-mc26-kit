@@ -57,7 +57,6 @@ func NewWorld(c *bot.Client, p *basic.Player, events EventsListener) (w *World) 
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayLevelChunkWithLight, F: w.handleLevelChunkWithLightPacket},
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayForgetLevelChunk, F: w.handleForgetLevelChunkPacket},
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayLightUpdate, F: w.handleLightUpdatePacket},
-		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayChunkBatchFinished, F: w.handleChunkBatchFinishedPacket},
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayBlockUpdate, F: w.handleBlockUpdate},
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlaySectionBlocksUpdate, F: w.handleSectionBlocksUpdate},
 		bot.PacketHandler{Priority: 0, ID: packetid.ClientboundPlayBlockChangedAck, F: w.handleBlockChangedAck},
@@ -65,24 +64,8 @@ func NewWorld(c *bot.Client, p *basic.Player, events EventsListener) (w *World) 
 	return
 }
 
-// DefaultChunksPerTick is the chunk rate the client asks for after every chunk
-// batch. Vanilla servers throttle chunk sending until the client acknowledges a
-// batch, and each acknowledgement carries the rate the client is willing to
-// receive; the vanilla client derives it from its own timing, a bot has no such
-// limit.
-const DefaultChunksPerTick = 64
-
-// handleChunkBatchFinishedPacket answers ClientboundChunkBatchFinished with
-// ServerboundChunkBatchReceived. Without the reply a vanilla server sends only
-// the first batch of chunks (protocol 764+).
-func (w *World) handleChunkBatchFinishedPacket(packet pk.Packet) error {
-	var finished play.ChunkBatchFinished
-	if err := packet.Scan(&finished); err != nil {
-		return err
-	}
-	ack := play.ChunkBatchReceived{DesiredChunksPerTick: DefaultChunksPerTick}
-	return w.c.Conn.WritePacket(pk.Marshal(ack.PacketID(), ack))
-}
+// (The answer to ClientboundChunkBatchFinished is basic.Player's: every client in play owes it, and a World
+// always comes with a basic.Player — see bot/basic/chunkbatch.go.)
 
 func (w *World) onPlayerSpawn(pk.Packet) error {
 	// unload all chunks

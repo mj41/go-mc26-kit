@@ -109,6 +109,46 @@ func TestAutofishRodGivenAfterTheStart(t *testing.T) {
 	})
 }
 
+// The harness of the bench moves the bot far from the spawn (a /tp to a pond it built), and the bobber it
+// casts there lands in chunks the server has yet to send: they are pending, and the game tells an entity only
+// to a player whose view has the chunk and sent it (ChunkMap.isChunkTracked). The server sends them after
+// the client answered the first batch (ChunkBatchReceived), which every client owes (bot/basic): a bot that
+// does not never sees the bobber, so it takes the splash for none of its own and never reels in.
+func TestAutofishBobberInChunksSentAfterTheFirstBatch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		out := logTo(t)
+		s := fakeserver.StartMem(t)
+		s.Fishing = &fakeserver.Fishing{BiteAfter: 5 * time.Second}
+		s.KeepAlive = 15 * time.Second
+		ctx, stop := context.WithCancel(t.Context())
+		ended := make(chan error, 1)
+		go func() { ended <- run(ctx, s.Addr, "Fisher", bot.JoinOptions{MCDialer: s.Dialer}) }()
+		if err := s.Joined(5 * time.Second); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		p := s.Players()[0]
+		if err := s.Teleport(p, 2000.5, 64, 2000.5); err != nil { // the pond
+			t.Fatal(err)
+		}
+		s.Fishing.GiveRod(p)
+		time.Sleep(46 * time.Second) // past the watchdog's 45: the rethrow
+		synctest.Wait()
+		if !s.Fishing.Out() {
+			t.Fatalf("no line in the water after the rethrow:\n%s", out)
+		}
+		time.Sleep(10 * time.Second) // the bite, reeled in
+		synctest.Wait()
+		if s.Fishing.Caught() < 1 || !strings.Contains(out.String(), "gra~") {
+			t.Errorf("%d fish caught after the first bite (the bobber's chunk was sent: it must be seen):\n%s", s.Fishing.Caught(), out)
+		}
+		stop()
+		if err := <-ended; err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	})
+}
+
 // logTo sends the log package's output (the example's) to a buffer till the test ends.
 func logTo(t *testing.T) *syncBuffer {
 	var b syncBuffer
