@@ -26,9 +26,15 @@ type NoPathError struct {
 	Searched int
 	Limit    bool
 	From     world.BlockPos
+	// Air: a step was refused for want of air (the way through water was longer than the air lasts): with
+	// more air, or a way to breathe on the way, a path may exist.
+	Air bool
 }
 
 func (e *NoPathError) Error() string {
+	if e.Air {
+		return fmt.Sprintf("%v: under water too long (the air does not last the way) from %v", ErrNoPath, e.From)
+	}
 	if e.Limit {
 		return fmt.Sprintf("%v: %d places searched from %v, the limit", ErrNoPath, e.Searched, e.From)
 	}
@@ -76,35 +82,30 @@ func (g *Graph) FindContext(ctx context.Context, start Node, goal world.BlockPos
 		dx, dy, dz := float64(p.X-goal.X), float64(p.Y-goal.Y), float64(p.Z-goal.Z)
 		return math.Sqrt(dx*dx + dy*dy + dz*dz)
 	}
-	type rec struct {
-		node   Node
-		g      float64
-		parent world.BlockPos
-		root   bool
-	}
-	seen := map[world.BlockPos]*rec{start.Pos: {node: start, root: true}}
-	open := &queue{{pos: start.Pos, f: h(start.Pos)}}
-	closed := map[world.BlockPos]bool{}
+	budget := g.airBudget()
+	airRefused := false
+	root := &label{node: start}
+	seen := map[world.BlockPos][]*label{start.Pos: {root}}
+	open := &queue{{r: root, f: h(start.Pos)}}
 	closest, closestH := start, h(start.Pos)
 	n := 0
 	for ; open.Len() > 0 && n < maxNodes; n++ {
 		if n&255 == 255 && ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		cur := heap.Pop(open).(item).pos
-		if closed[cur] {
+		r := heap.Pop(open).(item).r
+		if r.dead || r.closed {
 			continue
 		}
-		closed[cur] = true
-		r := seen[cur]
+		r.closed = true
+		cur := r.node.Pos
 		if hc := h(cur); hc < closestH {
 			closest, closestH = r.node, hc
 		}
 		if reached(cur) {
 			var out []Node
-			for !r.root {
+			for ; r.parent != nil; r = r.parent {
 				out = append(out, r.node)
-				r = seen[r.parent]
 			}
 			for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
 				out[i], out[j] = out[j], out[i]
@@ -112,16 +113,43 @@ func (g *Graph) FindContext(ctx context.Context, start Node, goal world.BlockPos
 			return out, nil
 		}
 		for _, e := range g.neighbours(r.node) {
-			cost := r.g + e.cost
-			if old, ok := seen[e.to.Pos]; ok && old.g <= cost {
+			used, ok := g.airUse(r.used, budget, r.node, e.to)
+			if !ok {
+				airRefused = true
 				continue
 			}
-			seen[e.to.Pos] = &rec{node: e.to, g: cost, parent: cur}
-			heap.Push(open, item{pos: e.to.Pos, f: cost + h(e.to.Pos)})
+			cost := r.g + e.cost
+			better := true
+			for _, o := range seen[e.to.Pos] {
+				if !o.dead && o.g <= cost && o.used <= used {
+					better = false
+					break
+				}
+			}
+			if !better {
+				continue
+			}
+			for _, o := range seen[e.to.Pos] {
+				if o.g >= cost && o.used >= used {
+					o.dead = true
+				}
+			}
+			nr := &label{node: e.to, g: cost, used: used, parent: r}
+			seen[e.to.Pos] = append(seen[e.to.Pos], nr)
+			heap.Push(open, item{r: nr, f: cost + h(e.to.Pos)})
 		}
 	}
+	if airRefused && !g.noAirLimit {
+		// a step was refused for want of air: was that why there is no way? With no limit on the air, is there one?
+		free := *g
+		free.noAirLimit = true
+		_, err := free.FindContext(ctx, start, goal, maxNodes)
+		airRefused = err == nil
+	} else {
+		airRefused = false
+	}
 	back := g.backNearest(start, h, maxNodes)
-	return nil, &NoPathError{Closest: closest, Back: back, Searched: n, Limit: open.Len() > 0, From: start.Pos}
+	return nil, &NoPathError{Closest: closest, Back: back, Searched: n, Limit: open.Len() > 0, From: start.Pos, Air: airRefused}
 }
 
 // backNearest is the place nearest the goal (by h) of those reached from
@@ -130,23 +158,32 @@ func (g *Graph) FindContext(ctx context.Context, start Node, goal world.BlockPos
 // found no way: run once more over what it can come back from).
 func (g *Graph) backNearest(start Node, h func(world.BlockPos) float64, maxNodes int) Node {
 	best, bestH := start, h(start.Pos)
-	seen := map[world.BlockPos]bool{start.Pos: true}
-	queue := []Node{start}
+	budget := g.airBudget()
+	type visit struct {
+		node Node
+		used int
+	}
+	least := map[world.BlockPos]int{start.Pos: 0} // the least air spent reaching a place
+	queue := []visit{{start, 0}}
 	for n := 0; len(queue) > 0 && n < maxNodes; n++ {
 		cur := queue[0]
 		queue = queue[1:]
-		if hc := h(cur.Pos); hc < bestH {
-			best, bestH = cur, hc
+		if hc := h(cur.node.Pos); hc < bestH {
+			best, bestH = cur.node, hc
 		}
-		for _, e := range g.neighbours(cur) {
+		for _, e := range g.neighbours(cur.node) {
 			// a level walk goes back the same way; any other edge only if
 			// the place it reaches has the edge back (a drop of two, a gap's
 			// jump: one way)
-			if seen[e.to.Pos] || e.to.Kind != Walk && !g.edgeBack(e.to, cur) {
+			used, ok := g.airUse(cur.used, budget, cur.node, e.to)
+			if !ok {
+				continue // (not through more water than the air lasts)
+			}
+			if old, seen := least[e.to.Pos]; seen && old <= used || e.to.Kind != Walk && !g.edgeBack(e.to, cur.node) {
 				continue
 			}
-			seen[e.to.Pos] = true
-			queue = append(queue, e.to)
+			least[e.to.Pos] = used
+			queue = append(queue, visit{e.to, used})
 		}
 	}
 	return best
@@ -162,9 +199,20 @@ func (g *Graph) edgeBack(b, a Node) bool {
 	return false
 }
 
+// label is a way to a place: the cost so far and the air spent (used, ticks; air.go). The labels of a place are
+// the ways to it that neither cost more nor have spent more than another; with no water there is one each.
+type label struct {
+	node   Node
+	g      float64
+	used   int
+	parent *label
+	dead   bool // a way with less cost and less air spent was found
+	closed bool
+}
+
 type item struct {
-	pos world.BlockPos
-	f   float64
+	r *label
+	f float64
 }
 
 type queue []item

@@ -32,6 +32,11 @@ type Graph struct {
 	// ground (default 4: round a pond where the way round is short); a bot
 	// that swims across sets it low.
 	StillWater float64
+	// Air, when set, is the air supply the walk starts with, in ticks (300 is full): the search plans no way
+	// through more water than that air lasts (air.go). Unset: a full supply.
+	Air func() int
+
+	noAirLimit bool // a search that asks whether the air alone refused the way (search.go)
 }
 
 // Kind is how a node is reached.

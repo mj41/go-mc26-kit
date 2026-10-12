@@ -57,3 +57,67 @@ deterministic.
 - `TestGotoSupersedesASearch`: a second `Goto` while a search is held; releasing it applies the second walk's
   path and never the first's, and the cancelled search ends within a bounded number of reads.
 - `TestNoPathIsPublishedByTheSearch`: an unreachable goal ends the walk `failed: …` with `NoPath()` set.
+
+# Breath: the air a walk through water costs
+
+## The defect
+
+The graph plans a swim through any number of cells with the head under water. A body's air is 300 ticks (15 s),
+one lost a tick while the eyes are in water, four given back a tick out of it; at none it drowns (2 health a
+second). A bot's walk "back up to the shelter" (bench run #110) went through a flooded cave with a roof over the
+water: at 1.84 blocks a second (11 ticks a block) the 15 s are 27 blocks one way; the run was longer, with no
+air on it, and the bot sank and drowned.
+
+## Design
+
+1. **The state in the search, not a per-node rule.** Whether a run of flooded cells is too long depends on the
+   run, which no rule about one node sees (every node of a long passage is the same as the nodes of a short
+   one). A distance-to-air field (a node is allowed when air is within so many cells) was the other choice: it
+   is a rule about one node and keeps a way back, but a passage with a shaft to the surface every few blocks
+   passes it for any length while the path itself never goes to the shaft and drowns. So the search carries
+   the air spent: a way to a place is `(cost, used)`, `used` in ticks.
+2. **`used` along an edge** (`airUse`). A step that starts or ends with the eyes in water (`submerged`: the cell
+   of the eyes, `floor + 1.62`, is water; a body swimming at the surface, head out, breathes) adds its swim time
+   — 11 ticks a block, a diagonal as long as it is (the walker's swim measured 10.3 along a passage, 5.5 up a
+   shaft: the 11 has the margin). A step between two places with the head out takes four ticks of `used` off
+   for each tick it lasts, to none: a pocket of air on the way, a bank, is a place to breathe. A step that would
+   take `used` over the **budget** is not an edge.
+3. **The budget** is three quarters of the air the walk starts with (`Graph.Air`, in ticks; unset: full, 300). The
+   quarter is the margin for a swim that goes slower than counted, a current or a mob's push, a plan made
+   again from the middle of the water; being in proportion, a body with little air left may still swim the few
+   blocks up to breathe (40 ticks of air: 30 ticks, two blocks). The start is the walk's: a plan from the
+   middle of the water is made with the air at that moment.
+4. **The labels.** A place is reached by several ways that differ in cost and air spent; the search keeps the
+   ones neither beaten in both (`label`), a way is dropped when another costs no more and has spent no more.
+   Dry land has one label a place, as before: the code is the old search when there is no water.
+   `backNearest` (the place nearest the goal a walk can come back from) is bounded by the same air.
+5. **The air the walker has.** `Walker` counts it as the game does, a tick with the eyes in water one off, a tick
+   out four on, from full at its first tick (`Walker.Air()`); a caller that knows the game's count (the entity
+   data) sets `Graph.Air` and the walker takes that. Each search gets a copy of the graph with the air at that
+   moment.
+6. **When only a too-long way exists** the search ends with `NoPathError{Air: true}`: it asks once more with no limit
+   on the air and says `Air` when that finds a way, so a goal that is shut in for another reason is not blamed on
+   the air. The error says `no way to the goal: under water too long (the air does not last the way)`, the
+   walk ends `failed: …` with it, and `NoPath()` has `Air` set: the caller (a bot's walkFailed) can dig a way
+   to air, build, or wait. The player stays on the dry side: the refusal comes before the first stroke.
+7. **A way that grows longer than the air.** While the air is below half, each tick the walker counts the most
+   air the way on spends (`airNeed`); when it is more than is left it plans again from where it is, which
+   finds the way out to breathe or says `under water too long` (it does not leave the body a way to take: a
+   replan that finds none is the caller's — a body under water with no way up has no walk that helps).
+
+## Not modelled
+
+Respiration, water breathing, a conduit; bubble columns; a roof so low that the eyes are under a solid cell
+(no body stands there). The swim time is one speed: a current, a slope, depth strider are not in it.
+
+## Tests
+
+- `TestAirLongPassageIsRefused` (the graph): a sealed room with a flooded passage the only way in. 8 and 18
+  blocks with full air are planned; 40 is refused with `Air` and the reason in the message; with the air at
+  150 the 18 is refused, the 8 planned; with 60 even the 8.
+- `TestAirNoWayThatIsNotTheAir`: the passage shut with stone says no more than "no way".
+- `TestAirPocketIsBreathed`: 15 flooded, 6 with the head out, 15 flooded is planned; 36 flooded is not.
+- `TestWalkThroughAFloodedPassage` (walker, physics): 12 blocks swum, air to spare (≥100); 40 refused before the
+  first stroke, the player on dry ground with all its air.
+- `TestWalkUnderWaterWithLittleAir`: a body 8 blocks into a passage with 150 ticks of air walks out by the near
+  mouth, keeps some air, and is refused the room 20 blocks on.

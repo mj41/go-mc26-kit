@@ -50,6 +50,9 @@ type Walker struct {
 	result    *searched      // a finished search not yet taken by Think
 	retryAt   int            // a follow whose target is unreachable searches again at this tick
 	refresh   bool           // a follow's goal moved: a new search starts while the path in hand is still walked
+
+	air     int // the air supply left, in ticks, as the walker counts it (air.go): 300 at the first tick, less under water
+	airSeen bool
 }
 
 // searched is a finished search: the walk (generation) and goal it was for, and what it found.
@@ -139,6 +142,7 @@ func (w *Walker) end(s *control.State, status string) {
 func (w *Walker) Think(s *control.State, bp *basic.Player) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.breathe(bp.Position())
 	if !w.job.active {
 		if w.Sneak { // standing still, sneak held all the same: an edge stays an edge
 			s.Input = control.Input{Shift: true}
@@ -228,6 +232,17 @@ func (w *Walker) Think(s *control.State, bp *basic.Player) {
 		return
 	}
 
+	if left := w.airLeft(); left < FullAir/2 {
+		// the air is going: the way on must not spend more of it than is left (it may have gone slower than
+		// the plan counted, or the body been pushed back); else it is planned again, which finds the way out
+		// to breathe or no way (air.go)
+		if start, ok := w.Graph.Start(pos.X, pos.Y, pos.Z); ok && w.Graph.airNeed(start, w.path[w.i:]) > left {
+			w.path = nil
+			s.Input = control.Input{Jump: w.inWater(bp), Shift: w.Sneak}
+			return
+		}
+	}
+
 	n := w.path[w.i]
 	tx, tz := float64(n.Pos.X)+0.5, float64(n.Pos.Z)+0.5
 	dist := math.Hypot(tx-pos.X, tz-pos.Z)
@@ -309,7 +324,7 @@ func (w *Walker) searchNow(pos basic.Position) *searched {
 		max = 100000 // a way out of a tunnel and round a hill
 	}
 	start, _ := w.Graph.Start(pos.X, pos.Y, pos.Z)
-	path, err := w.Graph.Find(start, w.job.goal, max)
+	path, err := w.searchGraph().Find(start, w.job.goal, max)
 	return &searched{gen: w.gen, goal: w.job.goal, path: path, err: err}
 }
 
@@ -328,7 +343,7 @@ func (w *Walker) startSearch(pos basic.Position) {
 	goal, gen := w.job.goal, w.gen
 	ctx, cancel := context.WithCancel(context.Background())
 	w.cancel, w.searching, w.searchFor = cancel, true, goal
-	g := w.Graph
+	g := w.searchGraph()
 	go func() {
 		path, err := g.FindContext(ctx, start, goal, max)
 		w.mu.Lock()
@@ -340,6 +355,48 @@ func (w *Walker) startSearch(pos basic.Position) {
 		w.result = &searched{gen: gen, goal: goal, path: path, err: err}
 		cancel()
 	}()
+}
+
+// Air is the air supply the walker counts it has left, in ticks (300 is full).
+func (w *Walker) Air() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.air
+}
+
+// breathe counts the air at a tick as the game does: a tick with the eyes in water takes one, a tick out of it
+// gives four back. The caller holds w.mu.
+func (w *Walker) breathe(pos basic.Position) {
+	if !w.airSeen {
+		w.air, w.airSeen = FullAir, true
+	}
+	eyes := world.BlockPos{X: int(math.Floor(pos.X)), Y: int(math.Floor(pos.Y + eyeHeight)), Z: int(math.Floor(pos.Z))}
+	if w.Graph.water(eyes) {
+		w.air = max(w.air-1, 0)
+	} else {
+		w.air = min(w.air+airRefill, FullAir)
+	}
+}
+
+// airLeft is the air supply the walker plans with: the graph's own Air when the caller sets one, else its count.
+// The caller holds w.mu.
+func (w *Walker) airLeft() int {
+	if w.Graph.Air != nil {
+		return w.Graph.airFrom()
+	}
+	return w.air
+}
+
+// searchGraph is the graph a search reads: the walker's, with the air the walk starts with (the graph's own
+// Air, when the caller sets one: it knows the game's count). The caller holds w.mu.
+func (w *Walker) searchGraph() *Graph {
+	if w.Graph.Air != nil {
+		return w.Graph
+	}
+	g := *w.Graph
+	air := w.air
+	g.Air = func() int { return air }
+	return &g
 }
 
 // stillThere checks the next few nodes are still places to be: a block put
